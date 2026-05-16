@@ -25,7 +25,7 @@ export const CheckoutTable = ({ rows, servers }) => {
   return (
     <div
       className="bg-[#111] border border-[#222] rounded-sm"
-      data-testid="checkout-table"
+      data-testid="checkouts-table"
     >
       {/* toolbar */}
       <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-[#222]">

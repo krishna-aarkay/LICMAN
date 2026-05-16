@@ -70,7 +70,7 @@ export const ReservationDialog = ({ open, onOpenChange, server, onCreated }) => 
               value={feature}
               onChange={(e) => setFeature(e.target.value)}
               className="w-full bg-[#0a0a0a] border border-[#222] px-2 py-2 text-xs text-white"
-              data-testid="reservation-feature"
+              data-testid="reservation-feature-select"
             >
               <option value="">— select feature —</option>
               {(server?.features || []).map((f) => (
@@ -106,7 +106,7 @@ export const ReservationDialog = ({ open, onOpenChange, server, onCreated }) => 
               onChange={(e) => setTarget(e.target.value)}
               placeholder={targetType === "USER" ? "e.g. asingh" : targetType === "HOST" ? "wks-bangalore-04" : "design_team"}
               className="w-full bg-[#0a0a0a] border border-[#222] px-2 py-2 text-xs text-white"
-              data-testid="reservation-target"
+              data-testid="reservation-target-input"
             />
           </Field>
 
@@ -118,7 +118,7 @@ export const ReservationDialog = ({ open, onOpenChange, server, onCreated }) => 
               value={count}
               onChange={(e) => setCount(e.target.value)}
               className="w-full bg-[#0a0a0a] border border-[#222] px-2 py-2 text-xs text-white tabular-nums"
-              data-testid="reservation-count"
+              data-testid="reservation-count-input"
             />
           </Field>
 
@@ -140,7 +140,7 @@ export const ReservationDialog = ({ open, onOpenChange, server, onCreated }) => 
             className="btn-brutal primary"
             onClick={submit}
             disabled={busy}
-            data-testid="reservation-submit"
+            data-testid="reservation-submit-btn"
           >
             {busy ? "SAVING…" : "ADD RESERVATION"}
           </button>

@@ -76,7 +76,7 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
 };
 
 const Stat = ({ label, value, ok, accent }) => (
-  <div className="flex items-center gap-2">
+  <div className="flex items-center gap-2" data-testid={`stat-${label.toLowerCase().replace(/[^a-z]/g, "")}`}>
     <span className="text-[#6b7280] uppercase tracking-wider">{label}</span>
     <span
       className="font-bold tabular-nums"

@@ -121,7 +121,7 @@ export default function ServerDetail() {
         <Link
           to="/"
           className="inline-flex items-center gap-1.5 text-[#9ca3af] hover:text-white font-mono text-xs"
-          data-testid="back-link"
+          data-testid="breadcrumb"
         >
           <ArrowLeft size={12} /> back to control room
         </Link>
@@ -294,6 +294,7 @@ export default function ServerDetail() {
               dirty={licDirty}
               onSave={saveLicense}
               testId="license-panel"
+              saveTestId="save-license-btn"
             >
               <CodeEditor
                 value={licText}
@@ -313,6 +314,7 @@ export default function ServerDetail() {
               dirty={optDirty}
               onSave={saveOptions}
               testId="options-panel"
+              saveTestId="save-options-btn"
               hint="Directives: RESERVE | INCLUDE | EXCLUDE | GROUP | MAX | TIMEOUT"
             >
               <CodeEditor
@@ -369,7 +371,7 @@ export default function ServerDetail() {
                           <button
                             className="btn-brutal danger text-[10px] py-1"
                             onClick={() => removeRes(r.id)}
-                            data-testid={`del-reservation-${r.id}`}
+                            data-testid={`delete-reservation-${r.id}`}
                           >
                             <Trash2 size={11} />
                           </button>
@@ -405,7 +407,7 @@ export default function ServerDetail() {
   );
 }
 
-const EditorPanel = ({ title, dirty, onSave, children, testId, hint }) => (
+const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint }) => (
   <div className="bg-[#111] border border-[#222] rounded-sm" data-testid={testId}>
     <div className="px-4 py-3 border-b border-[#222] flex items-center justify-between">
       <div>
@@ -414,7 +416,7 @@ const EditorPanel = ({ title, dirty, onSave, children, testId, hint }) => (
       </div>
       <div className="flex items-center gap-2">
         {dirty && (
-          <span className="font-mono text-[10px] text-[#f59e0b] uppercase tracking-wider">
+          <span className="font-mono text-[10px] text-[#f59e0b] uppercase tracking-wider" data-testid="editor-dirty-flag">
             ● UNSAVED
           </span>
         )}
@@ -422,7 +424,7 @@ const EditorPanel = ({ title, dirty, onSave, children, testId, hint }) => (
           className="btn-brutal primary flex items-center gap-1.5"
           onClick={onSave}
           disabled={!dirty}
-          data-testid={`${testId}-save`}
+          data-testid={saveTestId || `${testId}-save`}
         >
           <Save size={12} /> SAVE & APPLY
         </button>
