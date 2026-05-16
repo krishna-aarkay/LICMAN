@@ -260,6 +260,7 @@ export default function ServerDetail() {
               { v: "license", l: "LICENSE FILE", i: FileText },
               { v: "options", l: "OPTIONS", i: Settings },
               { v: "reservations", l: "RESERVATIONS", i: ListChecks },
+              { v: "ssh", l: "CONNECTION", i: Plug },
               { v: "audit", l: "AUDIT", i: Activity },
             ].map(({ v, l, i: Icon }) => (
               <TabsTrigger
