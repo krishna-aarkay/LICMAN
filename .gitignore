@@ -93,3 +93,12 @@ credentials.json
 !**/.env.example
 !**/.env.sample
 !**/env.example
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
