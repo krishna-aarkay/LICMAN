@@ -45,6 +45,8 @@ export default function ServerDetail() {
   const [stats, setStats] = useState(null);
   const [optValidation, setOptValidation] = useState(null);
   const [validating, setValidating] = useState(false);
+  const [selectedFeature, setSelectedFeature] = useState(null);
+  const [killing, setKilling] = useState(null);
 
   // remember last visited server
   useEffect(() => {
@@ -124,6 +126,23 @@ export default function ServerDetail() {
       toast.error(e?.response?.data?.detail || "Validation failed");
     } finally {
       setValidating(false);
+    }
+  };
+
+  const killCheckout = async (co) => {
+    if (!window.confirm(`Force-release ${co.feature} held by ${co.user}@${co.host}?\nThis runs lmremove.`)) return;
+    setKilling(co.id);
+    try {
+      const r = await api.killCheckout(id, {
+        feature: co.feature, user: co.user, host: co.host, display: co.display || "",
+      });
+      if (r.ok) toast.success(`Released ${co.feature} (${co.user})`);
+      else toast.error(r?.exec?.output?.slice(0, 200) || "lmremove failed");
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Kill failed");
+    } finally {
+      setKilling(null);
     }
   };
 
@@ -254,37 +273,60 @@ export default function ServerDetail() {
             </div>
           </div>
 
-          {/* features mini grid */}
-          <div className="mt-5 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2">
-            {(server.features || []).map((f) => {
-              const used = inUse(f.name);
-              const pct = Math.min(100, Math.round((used / Math.max(1, f.total)) * 100));
-              return (
-                <div
-                  key={f.name}
-                  className="border border-[#222] bg-[#0a0a0a] p-3"
-                  data-testid={`feature-cell-${f.name}`}
-                >
-                  <div className="font-mono text-xs text-white truncate">{f.name}</div>
-                  <div className="font-mono text-[10px] text-[#6b7280] mt-0.5">v{f.version}</div>
-                  <div className="mt-2 flex items-baseline gap-1">
-                    <span className="font-mono text-lg font-bold tabular-nums text-emerald-400">
+          {/* features — clickable rows that drill into per-feature checkouts */}
+          <div className="mt-5 border border-[#222] bg-[#0a0a0a] rounded-sm" data-testid="features-list">
+            <div className="grid grid-cols-12 gap-2 px-3 py-2 border-b border-[#222] font-mono text-[10px] uppercase tracking-wider text-[#6b7280]">
+              <div className="col-span-4">Feature</div>
+              <div className="col-span-2">Version</div>
+              <div className="col-span-1 text-right">Seats</div>
+              <div className="col-span-1 text-right">In Use</div>
+              <div className="col-span-3">Utilization</div>
+              <div className="col-span-1 text-right">Open</div>
+            </div>
+            {(server.features || []).length === 0 ? (
+              <div className="px-3 py-6 font-mono text-xs text-[#6b7280]">
+                {"// no features parsed yet — run SYNC or save the license file"}
+              </div>
+            ) : (
+              (server.features || []).map((f) => {
+                const used = inUse(f.name);
+                const pct = Math.min(100, Math.round((used / Math.max(1, f.total)) * 100));
+                const color = pct > 80 ? "#ef4444" : pct > 50 ? "#f59e0b" : "#10b981";
+                return (
+                  <button
+                    key={f.name}
+                    onClick={() => setSelectedFeature(f.name)}
+                    className="w-full text-left grid grid-cols-12 gap-2 items-center px-3 py-2 border-t border-[#1a1a1a] hover:bg-[#141414] transition-colors group"
+                    data-testid={`feature-row-${f.name}`}
+                  >
+                    <div className="col-span-4 font-mono text-xs text-white truncate group-hover:text-emerald-400">
+                      {f.name}
+                    </div>
+                    <div className="col-span-2 font-mono text-[10px] text-[#9ca3af]">v{f.version}</div>
+                    <div className="col-span-1 font-mono text-xs text-right text-[#9ca3af] tabular-nums">
+                      {f.total}
+                    </div>
+                    <div className="col-span-1 font-mono text-xs text-right tabular-nums font-bold" style={{ color }}>
                       {used}
-                    </span>
-                    <span className="font-mono text-[10px] text-[#6b7280]">/ {f.total}</span>
-                  </div>
-                  <div className="mt-2 h-[3px] bg-[#1a1a1a]">
-                    <div
-                      className="h-full transition-all"
-                      style={{
-                        width: `${pct}%`,
-                        background: pct > 80 ? "#ef4444" : pct > 50 ? "#f59e0b" : "#10b981",
-                      }}
-                    />
-                  </div>
-                </div>
-              );
-            })}
+                    </div>
+                    <div className="col-span-3 flex items-center gap-2">
+                      <div className="flex-1 h-1.5 bg-[#1a1a1a] rounded-sm overflow-hidden">
+                        <div
+                          className="h-full transition-all"
+                          style={{ width: `${pct}%`, background: color }}
+                        />
+                      </div>
+                      <span className="font-mono text-[10px] tabular-nums text-[#9ca3af] w-9 text-right">
+                        {pct}%
+                      </span>
+                    </div>
+                    <div className="col-span-1 text-right font-mono text-[10px] uppercase tracking-wider text-[#6b7280] group-hover:text-emerald-400">
+                      DETAILS →
+                    </div>
+                  </button>
+                );
+              })
+            )}
           </div>
         </section>
 
@@ -329,6 +371,7 @@ export default function ServerDetail() {
                       <th className="px-4 py-2">Host</th>
                       <th className="px-4 py-2 text-right">PID</th>
                       <th className="px-4 py-2 text-right">Since</th>
+                      {isAdmin && <th className="px-4 py-2 text-right">Action</th>}
                     </tr>
                   </thead>
                   <tbody>
@@ -340,11 +383,23 @@ export default function ServerDetail() {
                         <td className="px-4 py-2 text-[#9ca3af]">{r.host}</td>
                         <td className="px-4 py-2 text-right text-[#9ca3af] tabular-nums">{r.pid}</td>
                         <td className="px-4 py-2 text-right text-[#9ca3af] tabular-nums">{fmtAgo(r.checkout_time)}</td>
+                        {isAdmin && (
+                          <td className="px-4 py-2 text-right">
+                            <button
+                              onClick={() => killCheckout(r)}
+                              disabled={killing === r.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 border border-red-900/60 text-red-400 hover:bg-red-900/20 text-[10px] uppercase tracking-wider disabled:opacity-50"
+                              data-testid={`detail-kill-${r.id}`}
+                            >
+                              {killing === r.id ? "…" : "KILL"}
+                            </button>
+                          </td>
+                        )}
                       </tr>
                     ))}
                     {checkouts.length === 0 && (
                       <tr>
-                        <td colSpan={6} className="px-4 py-10 text-center text-[#6b7280]">
+                        <td colSpan={isAdmin ? 7 : 6} className="px-4 py-10 text-center text-[#6b7280]">
                           {"// no active checkouts"}
                         </td>
                       </tr>
@@ -563,9 +618,147 @@ export default function ServerDetail() {
         server={server}
         onCreated={load}
       />
+
+      {/* Feature detail drawer */}
+      {selectedFeature && (
+        <FeatureDetailModal
+          feature={server.features?.find((x) => x.name === selectedFeature)}
+          server={server}
+          checkouts={checkouts.filter((c) => c.feature === selectedFeature)}
+          reservations={reservations.filter((r) => r.feature === selectedFeature)}
+          onClose={() => setSelectedFeature(null)}
+          onKill={killCheckout}
+          killing={killing}
+          canKill={isAdmin}
+        />
+      )}
     </div>
   );
 }
+
+const FeatureDetailModal = ({ feature, server, checkouts, reservations, onClose, onKill, killing, canKill }) => {
+  if (!feature) return null;
+  const used = checkouts.length;
+  const pct = Math.min(100, Math.round((used / Math.max(1, feature.total)) * 100));
+  const color = pct > 80 ? "#ef4444" : pct > 50 ? "#f59e0b" : "#10b981";
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-4"
+      onClick={onClose}
+      data-testid="feature-detail-modal"
+    >
+      <div
+        className="bg-[#0a0a0a] border border-[#222] rounded-sm max-w-4xl w-full max-h-[85vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-[#222] flex items-start justify-between gap-4">
+          <div>
+            <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-[#6b7280]">
+              {server.name} · {server.vendor}
+            </div>
+            <h2 className="font-mono text-xl font-bold mt-1">{feature.name}</h2>
+            <div className="font-mono text-[11px] text-[#9ca3af] mt-0.5">
+              v{feature.version} · expires {feature.expires}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-[#9ca3af] hover:text-white font-mono text-sm"
+            data-testid="feature-modal-close"
+          >
+            ✕ CLOSE
+          </button>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3 px-5 py-4 border-b border-[#222] font-mono text-xs">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-[#6b7280]">SEATS</div>
+            <div className="text-2xl font-bold tabular-nums mt-1">{feature.total}</div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-[#6b7280]">IN USE</div>
+            <div className="text-2xl font-bold tabular-nums mt-1" style={{ color }}>
+              {used}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-[#6b7280]">UTILIZATION</div>
+            <div className="flex items-center gap-2 mt-2">
+              <div className="flex-1 h-2 bg-[#1a1a1a] rounded-sm overflow-hidden">
+                <div className="h-full" style={{ width: `${pct}%`, background: color }} />
+              </div>
+              <span className="tabular-nums">{pct}%</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="px-5 py-3 font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
+          ACTIVE CHECKOUTS · {checkouts.length}
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full font-mono text-xs">
+            <thead className="bg-[#0d0d0d]">
+              <tr className="text-left text-[10px] uppercase tracking-wider text-[#6b7280]">
+                <th className="px-4 py-2">User</th>
+                <th className="px-4 py-2">Host</th>
+                <th className="px-4 py-2">Display</th>
+                <th className="px-4 py-2 text-right">PID</th>
+                <th className="px-4 py-2 text-right">Since</th>
+                {canKill && <th className="px-4 py-2 text-right">Action</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {checkouts.map((c) => (
+                <tr key={c.id} className="border-t border-[#1a1a1a] hover:bg-[#141414]">
+                  <td className="px-4 py-2 text-emerald-400">{c.user}</td>
+                  <td className="px-4 py-2 text-[#9ca3af]">{c.host}</td>
+                  <td className="px-4 py-2 text-[#6b7280]">{c.display}</td>
+                  <td className="px-4 py-2 text-right tabular-nums">{c.pid}</td>
+                  <td className="px-4 py-2 text-right text-[#9ca3af]">{fmtAgo(c.checkout_time)}</td>
+                  {canKill && (
+                    <td className="px-4 py-2 text-right">
+                      <button
+                        onClick={() => onKill(c)}
+                        disabled={killing === c.id}
+                        className="inline-flex items-center gap-1 px-2 py-1 border border-red-900/60 text-red-400 hover:bg-red-900/20 text-[10px] uppercase tracking-wider disabled:opacity-50"
+                        data-testid={`feature-kill-${c.id}`}
+                      >
+                        {killing === c.id ? "…" : "KILL"}
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+              {checkouts.length === 0 && (
+                <tr>
+                  <td colSpan={canKill ? 6 : 5} className="px-4 py-8 text-center text-[#6b7280]">
+                    {"// idle — nobody is using this feature right now"}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {reservations.length > 0 && (
+          <>
+            <div className="px-5 py-3 border-t border-[#222] font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
+              RESERVATIONS · {reservations.length}
+            </div>
+            <ul className="px-5 pb-5 font-mono text-xs space-y-1">
+              {reservations.map((r) => (
+                <li key={r.id} className="text-[#9ca3af]">
+                  <span className="text-[#3b82f6] font-bold">{r.target_type}</span>{" "}
+                  <span className="text-white">{r.target}</span> · {r.count} seat(s)
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
 
 const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint, extraActions }) => (
   <div className="bg-[#111] border border-[#222] rounded-sm" data-testid={testId}>

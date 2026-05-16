@@ -1,0 +1,41 @@
+{
+  "summary": "Iteration 8 — Full validation of NEW features (UTC↔IST TZ toggle, Usage History page + filters + CSV export + sortable columns, Kill checkout via lmremove, Feature Detail modal on ServerDetail, sortable headers on Dashboard/Expiry/Usage). Backend: 24/24 new iteration-8 tests PASS + 21/21 iteration-7 regression PASS = 45/45 (100%). Frontend: 13/13 critical UI flows verified via Playwright on live preview URL — TZ flips IST↔UTC↔IST correctly, Usage page renders with 7 preset buttons + 7 sortable headers + correct /api/usage/export anchor, Dashboard CheckoutTable shows 7 sortable headers + 82 kill buttons (admin), Expiry page 8 sortable headers, ServerDetail shows 5 clickable feature rows that open the feature-detail-modal with kill buttons, Checkouts tab shows 14 detail-kill buttons. Mock-mode kill returns ok:true exec.mode='mock'. Engineer role correctly receives 403. usage_history upsert is idempotent — no duplicate explosion on repeated /api/checkouts. CSV header matches spec exactly. No bugs found.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration8.py",
+    "/app/test_reports/pytest/iteration8.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 2242 lines (was 1968 in iter7) — well over the 700-line guideline. Splitting into auth.py, usage.py, crypto.py, scheduler.py, options_validator.py, csv_exports.py becomes urgent before iter9.",
+    "kill_checkout (server.py:1332-1364) does NOT validate the `feature`, `user`, or `host` payload values against any allow-list / regex — these strings get directly interpolated into a shell command (`lmremove -h {feature} {vendor_daemon} {host} {user}`). In SSH adapter mode this is a shell-injection vector if any of those fields contains a space, semicolon, backtick, or `$()`. Recommend shlex.quote() each user-supplied value or validate against /^[A-Za-z0-9._@:-]+$/ before composing the command.",
+    "usage_history TTL index uses BSON Date field `last_seen` (good) but the DB query / sort path uses `last_seen_iso` (string). Mixing two timestamp representations in one collection invites subtle bugs — pick one. The sort on the string ISO works only because ISO-8601 strings sort lexicographically.",
+    "_build_usage_query (server.py:1926-1947) anchors user/feature regex with ^ and $ but the `vendor` filter is exact-match (no anchoring). Slight inconsistency — vendor case-sensitivity will trip up admins.",
+    "/api/usage/export builds the full CSV in memory via StringIO. With 10k+ rows + USAGE_TTL_DAYS=365 this could allocate megabytes. Wrap in StreamingResponse like is recommended for /api/expiry/export.",
+    "/api/usage (GET) is NOT gated by require_admin — any authenticated engineer can pull the full usage history including PIDs and host names. Consider whether engineer role should see only their own sessions, or admin-only.",
+    "/api/usage/facets (GET) shares the same exposure — non-admin engineers can enumerate every user/host/server name. Tighten if needed."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration8.py (new — 24 tests across 7 classes)",
+    "/app/test_reports/pytest/iteration8.xml (new)",
+    "/app/test_reports/iteration_8.json (new)"
+  ],
+  "success_rate": {
+    "backend": "45/45 (100%) — 24 iteration-8 new + 21 iteration-7 regression",
+    "frontend": "13/13 critical flows (100%) — tz-toggle, nav-usage, usage-preset-*, custom date inputs, usage-export-csv-btn href, usage-sort-* headers, checkouts-sort-*, kill-checkout-*, expiry-sort-*, feature-row-*, feature-detail-modal, feature-modal-close, detail-kill-*"
+  },
+  "test_credentials": "admin@example.com / adminpass123 (verified). Temp engineer user TEST_eng_<uuid>@example.com created via POST /api/users for 403 test then left in DB (uuid-suffixed so idempotent across runs).",
+  "seed_data_creation": "No persistent seed changes. Tests call /api/checkouts to populate usage_history; relies on existing seeded mock servers (cadence-prod-01, siemens-mentor-prod-01, synopsys-prod-01). On a fresh DB, seed_if_empty() seeds them automatically.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All iteration-8 features green. Reusable harness: /app/backend/tests/test_iteration8.py uses requests.Session + cookie-jar; reads REACT_APP_BACKEND_URL from env (export it or run from a shell that has /app/frontend/.env loaded). To populate usage_history call GET /api/checkouts first (random mocked data so counts vary per run). UI confirmed testids: tz-toggle, nav-usage, usage-preset-{today|7d|30d|90d|1y|all|custom}, usage-export-csv-btn (anchor with href containing /api/usage/export), usage-sort-*, checkouts-sort-*, kill-checkout-*, expiry-sort-*, feature-row-*, feature-detail-modal, feature-modal-close, feature-kill-*, detail-kill-*. Code-review focus items: server.py size + shell-injection risk in kill_checkout + missing admin gate on /api/usage and /api/usage/facets.",
+  "rca_of_the_issue": "N/A — no bugs found this iteration. The single Playwright assertion failure (`tz_toggle_flips: False`) was a test-harness false negative: clock string equality across ~1 second of ticking. Manual inspection of the captured labels confirms the actual TZ flip is correct: IST 21:10:59 → UTC 15:40:59 → IST 21:11:00."
+}

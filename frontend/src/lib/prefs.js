@@ -5,6 +5,7 @@ const defaults = {
   vendorFilter: "ALL",
   searchQuery: "",
   lastServerId: null,
+  tz: "IST",
 };
 
 export const prefs = {

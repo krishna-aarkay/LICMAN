@@ -168,7 +168,7 @@ export default function Dashboard() {
 
         {/* Main grid */}
         <section className="grid grid-cols-1 xl:grid-cols-[1fr_420px] gap-6">
-          <CheckoutTable rows={checkouts} servers={servers} />
+          <CheckoutTable rows={checkouts} servers={servers} onChange={load} />
           <AuditTimeline rows={audit} />
         </section>
 

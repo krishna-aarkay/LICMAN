@@ -69,6 +69,19 @@ export const api = {
   // checkouts
   serverCheckouts: (id) => http.get(`/servers/${id}/checkouts`).then((r) => r.data),
   allCheckouts: () => http.get(`/checkouts`).then((r) => r.data),
+  killCheckout: (server_id, data) =>
+    http.post(`/servers/${server_id}/checkouts/kill`, data).then((r) => r.data),
+
+  // usage history
+  usage: (params) => http.get(`/usage`, { params }).then((r) => r.data),
+  usageSummary: (params) => http.get(`/usage/summary`, { params }).then((r) => r.data),
+  usageFacets: () => http.get(`/usage/facets`).then((r) => r.data),
+  usageExportUrl: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v !== null && v !== undefined),
+    ).toString();
+    return `${API}/usage/export${qs ? `?${qs}` : ""}`;
+  },
 
   // reservations
   listReservations: (server_id) =>
@@ -156,4 +169,37 @@ export const fmtAgo = (iso) => {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   return `${Math.floor(diff / 86400)}d ago`;
+};
+
+// Format a Date as a HH:MM:SS clock in the requested timezone label.
+// Supported labels: "UTC" or "IST" (+05:30). Anything else falls back to UTC.
+export const fmtClock = (d, tz = "IST") => {
+  const date = d instanceof Date ? d : new Date(d);
+  if (tz === "IST") {
+    return date.toLocaleTimeString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+  return date.toISOString().slice(11, 19);
+};
+
+// Format an ISO timestamp into a compact local label "YYYY-MM-DD HH:MM" in tz.
+export const fmtDateTime = (iso, tz = "IST") => {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (isNaN(date.getTime())) return iso;
+  if (tz === "IST") {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }).formatToParts(date);
+    const get = (t) => parts.find((p) => p.type === t)?.value || "";
+    return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
+  }
+  return date.toISOString().slice(0, 16).replace("T", " ");
 };

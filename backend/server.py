@@ -611,6 +611,49 @@ async def gather_checkouts(server: dict) -> list:
     return generate_checkouts(server)
 
 
+async def record_usage_history(server: dict, checkouts: list):
+    """Upsert a usage_history entry per active checkout.
+    Key: (server_id, feature, user, host, pid, checkout_time). We track first_seen
+    and last_seen so the same checkout session counted across multiple sync ticks
+    yields a single row whose duration_seconds = last_seen - first_seen.
+    """
+    if not checkouts:
+        return
+    now = datetime.now(timezone.utc)
+    server_name = server.get("name", "")
+    vendor = server.get("vendor", "")
+    server_id = server.get("id", "")
+    for c in checkouts:
+        key = {
+            "server_id": server_id,
+            "feature": c.get("feature", ""),
+            "user": c.get("user", ""),
+            "host": c.get("host", ""),
+            "pid": c.get("pid", 0),
+            "checkout_time": c.get("checkout_time", ""),
+        }
+        update = {
+            "$setOnInsert": {
+                **key,
+                "id": str(uuid.uuid4()),
+                "server_name": server_name,
+                "vendor": vendor,
+                "version": c.get("version", ""),
+                "display": c.get("display", ""),
+                "first_seen": now,
+                "first_seen_iso": now.isoformat(),
+            },
+            "$set": {
+                "last_seen": now,
+                "last_seen_iso": now.isoformat(),
+            },
+        }
+        try:
+            await db.usage_history.update_one(key, update, upsert=True)
+        except Exception as e:
+            logger.warning(f"usage_history upsert failed: {e}")
+
+
 
 def default_license_text(vendor: str, name: str, port: int, daemon: str):
     """Build a plausible-looking license file."""
@@ -1278,6 +1321,49 @@ async def restart(server_id: str):
     return {"ok": True, "message": f"{doc['daemon']} restarted on {doc['name']}", "exec": exec_log}
 
 
+class KillCheckoutPayload(BaseModel):
+    feature: str
+    user: str
+    host: str
+    display: str = ""
+    vendor_daemon: str = ""  # e.g. "snpslmd", "cdslmd". If empty, uses server.daemon
+
+
+@api_router.post("/servers/{server_id}/checkouts/kill")
+async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dict = Depends(require_admin)):
+    """Forcibly release a checked-out license via `lmremove`.
+    Real SSH path uses:  lmremove -h <feature> <vendor_daemon> <host> <user>
+    Mock mode logs the intent + audit entry without contacting any server.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    vendor_daemon = (payload.vendor_daemon or doc.get("daemon") or "").strip()
+    if not vendor_daemon:
+        raise HTTPException(400, "vendor_daemon is required (or set server.daemon)")
+    lmutil = ((doc.get("ssh") or {}).get("lmutil_path") or "lmutil").strip()
+    # FlexLM lmremove syntax with -h forces remove without confirmation:
+    #   lmremove -h <feature> <vendor_daemon> <host> <user>
+    cmd = f"{lmutil} lmremove -h {payload.feature} {vendor_daemon} {payload.host} {payload.user}"
+    exec_log = await ssh_execute(doc, cmd)
+    ok = exec_log.get("exit") == 0 or exec_log.get("mode") == "mock"
+    severity = "success" if ok else "error"
+    await log_audit(
+        "CHECKOUT_KILL",
+        f"kill {payload.feature} for {payload.user}@{payload.host} on {doc['name']} "
+        f"[{exec_log.get('mode')}] · {(exec_log.get('output') or '')[:200]}",
+        server_id, doc["name"], severity,
+    )
+    if ok:
+        await db.checkouts.delete_many({
+            "server_id": server_id,
+            "feature": payload.feature,
+            "user": payload.user,
+            "host": payload.host,
+        })
+    return {"ok": ok, "message": f"lmremove issued for {payload.feature}", "exec": exec_log}
+
+
 @api_router.post("/servers/{server_id}/toggle")
 async def toggle_status(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
@@ -1299,6 +1385,7 @@ async def server_checkouts(server_id: str):
     await db.checkouts.delete_many({"server_id": server_id})
     if fresh:
         await db.checkouts.insert_many([{**c} for c in fresh])
+        await record_usage_history(doc, fresh)
     return fresh
 
 
@@ -1309,6 +1396,7 @@ async def all_checkouts():
     for srv in servers:
         fresh = await gather_checkouts(srv)
         all_co.extend(fresh)
+        await record_usage_history(srv, fresh)
     await db.checkouts.delete_many({})
     if all_co:
         await db.checkouts.insert_many([{**c} for c in all_co])
@@ -1413,6 +1501,7 @@ async def sync_server(server_id: str, _: dict = Depends(require_admin)):
     await db.checkouts.delete_many({"server_id": server_id})
     if parsed["checkouts"]:
         await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+        await record_usage_history(doc, parsed["checkouts"])
     await log_audit("SYNC_OK",
                     f"Synced {doc['name']}: {len(parsed['features'])} features, {len(parsed['checkouts'])} checkouts",
                     server_id, doc["name"], "success")
@@ -1478,6 +1567,7 @@ async def sync_all_servers(_: dict = Depends(require_admin)):
             await db.checkouts.delete_many({"server_id": srv["id"]})
             if parsed["checkouts"]:
                 await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+                await record_usage_history(srv, parsed["checkouts"])
             total_feats += len(parsed["features"])
             total_co += len(parsed["checkouts"])
             results.append({
@@ -1815,6 +1905,177 @@ async def audit(limit: int = 50):
     return docs
 
 
+# ---------- Usage history ----------
+
+def _parse_iso_to_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # Accept 'YYYY-MM-DD' or full ISO. Treat naive as UTC.
+        if len(s) == 10 and s.count("-") == 2:
+            dt = datetime.fromisoformat(s + "T00:00:00+00:00")
+        else:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _build_usage_query(*, from_dt: Optional[datetime], to_dt: Optional[datetime],
+                      user: Optional[str], feature: Optional[str],
+                      server_id: Optional[str], vendor: Optional[str]) -> dict:
+    q: dict = {}
+    if from_dt or to_dt:
+        # We consider a session "in range" if its [first_seen, last_seen] overlaps [from, to]
+        range_clauses = []
+        if from_dt:
+            range_clauses.append({"last_seen": {"$gte": from_dt}})
+        if to_dt:
+            range_clauses.append({"first_seen": {"$lte": to_dt}})
+        if range_clauses:
+            q["$and"] = range_clauses
+    if user:
+        q["user"] = {"$regex": f"^{re.escape(user)}$", "$options": "i"}
+    if feature:
+        q["feature"] = {"$regex": f"^{re.escape(feature)}$", "$options": "i"}
+    if server_id:
+        q["server_id"] = server_id
+    if vendor:
+        q["vendor"] = vendor
+    return q
+
+
+@api_router.get("/usage")
+async def usage_history_list(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    user: Optional[str] = None,
+    feature: Optional[str] = None,
+    server_id: Optional[str] = None,
+    vendor: Optional[str] = None,
+    limit: int = 1000,
+):
+    """List historical license usage sessions. Times are UTC ISO strings.
+    Supports date_from/date_to (YYYY-MM-DD or full ISO), user, feature, server_id, vendor filters.
+    """
+    q = _build_usage_query(
+        from_dt=_parse_iso_to_dt(date_from),
+        to_dt=_parse_iso_to_dt(date_to),
+        user=user, feature=feature, server_id=server_id, vendor=vendor,
+    )
+    docs = await db.usage_history.find(
+        q, {"_id": 0, "first_seen": 0, "last_seen": 0}
+    ).sort("last_seen_iso", -1).to_list(min(max(limit, 1), 5000))
+    return docs
+
+
+@api_router.get("/usage/export")
+async def usage_history_export(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    user: Optional[str] = None,
+    feature: Optional[str] = None,
+    server_id: Optional[str] = None,
+    vendor: Optional[str] = None,
+    limit: int = 10000,
+):
+    """Stream the same filtered usage history as CSV."""
+    q = _build_usage_query(
+        from_dt=_parse_iso_to_dt(date_from),
+        to_dt=_parse_iso_to_dt(date_to),
+        user=user, feature=feature, server_id=server_id, vendor=vendor,
+    )
+    docs = await db.usage_history.find(
+        q, {"_id": 0, "first_seen": 0, "last_seen": 0}
+    ).sort("last_seen_iso", -1).to_list(min(max(limit, 1), 100000))
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow([
+        "first_seen", "last_seen", "duration_seconds",
+        "vendor", "server_name", "feature", "version",
+        "user", "host", "display", "pid", "checkout_time",
+    ])
+    for d in docs:
+        try:
+            f = _parse_iso_to_dt(d.get("first_seen_iso"))
+            l_ = _parse_iso_to_dt(d.get("last_seen_iso"))
+            dur = int((l_ - f).total_seconds()) if (f and l_) else ""
+        except Exception:
+            dur = ""
+        w.writerow([
+            d.get("first_seen_iso", ""), d.get("last_seen_iso", ""), dur,
+            d.get("vendor", ""), d.get("server_name", ""), d.get("feature", ""),
+            d.get("version", ""), d.get("user", ""), d.get("host", ""),
+            d.get("display", ""), d.get("pid", ""), d.get("checkout_time", ""),
+        ])
+    filename = f"licman-usage-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@api_router.get("/usage/summary")
+async def usage_history_summary(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    user: Optional[str] = None,
+    feature: Optional[str] = None,
+    server_id: Optional[str] = None,
+    vendor: Optional[str] = None,
+    group_by: Literal["user", "feature", "vendor", "server_name"] = "feature",
+):
+    """Aggregate usage history by user/feature/vendor/server. Returns sorted by total sessions desc."""
+    q = _build_usage_query(
+        from_dt=_parse_iso_to_dt(date_from),
+        to_dt=_parse_iso_to_dt(date_to),
+        user=user, feature=feature, server_id=server_id, vendor=vendor,
+    )
+    pipeline = [
+        {"$match": q},
+        {"$group": {
+            "_id": f"${group_by}",
+            "sessions": {"$sum": 1},
+            "unique_users": {"$addToSet": "$user"},
+            "unique_features": {"$addToSet": "$feature"},
+            "first_seen_min": {"$min": "$first_seen_iso"},
+            "last_seen_max": {"$max": "$last_seen_iso"},
+        }},
+        {"$project": {
+            "_id": 0,
+            "key": "$_id",
+            "sessions": 1,
+            "user_count": {"$size": "$unique_users"},
+            "feature_count": {"$size": "$unique_features"},
+            "first_seen": "$first_seen_min",
+            "last_seen": "$last_seen_max",
+        }},
+        {"$sort": {"sessions": -1}},
+        {"$limit": 1000},
+    ]
+    rows = await db.usage_history.aggregate(pipeline).to_list(1000)
+    return {"group_by": group_by, "rows": rows}
+
+
+@api_router.get("/usage/facets")
+async def usage_history_facets():
+    """Distinct users / features / vendors / servers for filter dropdowns."""
+    users = await db.usage_history.distinct("user")
+    features = await db.usage_history.distinct("feature")
+    vendors = await db.usage_history.distinct("vendor")
+    servers = await db.usage_history.distinct("server_name")
+    return {
+        "users": sorted([u for u in users if u]),
+        "features": sorted([f for f in features if f]),
+        "vendors": sorted([v for v in vendors if v]),
+        "servers": sorted([s for s in servers if s]),
+        "total_rows": await db.usage_history.count_documents({}),
+    }
+
+
 @api_router.get("/stats")
 async def stats():
     servers = await db.servers.find({}, {"_id": 0}).to_list(500)
@@ -1842,6 +2103,7 @@ async def seed_reset(_: dict = Depends(require_admin)):
     await db.reservations.delete_many({})
     await db.audit.delete_many({})
     await db.alert_events.delete_many({})
+    await db.usage_history.delete_many({})
     await seed_if_empty()
     return {"ok": True}
 
@@ -1907,6 +2169,7 @@ async def _periodic_sync_loop():
                     await db.checkouts.delete_many({"server_id": srv["id"]})
                     if parsed["checkouts"]:
                         await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+                        await record_usage_history(srv, parsed["checkouts"])
                 except Exception as e:
                     logger.warning(f"auto-sync failed for {srv.get('name')}: {e}")
             try:
@@ -1934,6 +2197,11 @@ async def startup_event():
         (db.checkouts, [("server_id", 1)], {}),
         (db.reservations, [("server_id", 1)], {}),
         (db.alert_events, [("timestamp", -1)], {}),
+        (db.usage_history, [("server_id", 1), ("feature", 1), ("user", 1), ("host", 1), ("pid", 1), ("checkout_time", 1)], {"unique": True}),
+        (db.usage_history, [("last_seen_iso", -1)], {}),
+        (db.usage_history, [("user", 1)], {}),
+        (db.usage_history, [("feature", 1)], {}),
+        (db.usage_history, [("vendor", 1)], {}),
     ]:
         try:
             await idx[0].create_index(idx[1], **idx[2])
@@ -1948,6 +2216,12 @@ async def startup_event():
     # Note: TTL needs a real BSON Date, not a string. We add a `ts` field on inserts via a wrapper.
     await db.audit.create_index([("timestamp", -1)])
     await db.audit.create_index("ts", expireAfterSeconds=ttl_days * 86400)
+    # Usage history TTL — keep last USAGE_TTL_DAYS (default 365 days)
+    usage_ttl_days = int(os.environ.get("USAGE_TTL_DAYS", "365"))
+    try:
+        await db.usage_history.create_index("last_seen", expireAfterSeconds=usage_ttl_days * 86400)
+    except Exception as e:
+        logger.warning(f"usage_history TTL index skipped: {e}")
     # Seed if applicable
     await seed_if_empty()
     # Start auto-sync loop

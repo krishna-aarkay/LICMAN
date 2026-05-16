@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Calendar, Search, Download } from "lucide-react";
+import { Calendar, Search, Download, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
 import { api, vendorMeta } from "@/lib/api";
 import Header from "@/components/Header";
 import ExpiryBadge from "@/components/ExpiryBadge";
@@ -11,6 +11,7 @@ export default function Expiry() {
   const [q, setQ] = useState("");
   const [vendorFilter, setVendorFilter] = useState("ALL");
   const [statusFilter, setStatusFilter] = useState("ALL");
+  const [sort, setSort] = useState({ col: "days_remaining", dir: "asc" });
 
   useEffect(() => {
     api.expiry(180).then(setRows);
@@ -30,8 +31,33 @@ export default function Expiry() {
         return false;
       return true;
     });
-    return filtered;
-  }, [rows, vendorFilter, statusFilter, q]);
+    const out = [...filtered];
+    const { col, dir } = sort;
+    const mult = dir === "asc" ? 1 : -1;
+    out.sort((a, b) => {
+      let av = a[col];
+      let bv = b[col];
+      if (col === "days_remaining") {
+        // Push null (permanent) to the end regardless of dir
+        if (av === null && bv === null) return 0;
+        if (av === null) return 1;
+        if (bv === null) return -1;
+      }
+      av = av ?? "";
+      bv = bv ?? "";
+      if (typeof av === "number" && typeof bv === "number") return (av - bv) * mult;
+      return String(av).localeCompare(String(bv)) * mult;
+    });
+    return out;
+  }, [rows, vendorFilter, statusFilter, q, sort]);
+
+  const toggleSort = (col) =>
+    setSort((cur) => (cur.col === col ? { col, dir: cur.dir === "asc" ? "desc" : "asc" } : { col, dir: "asc" }));
+
+  const sortIcon = (col) => {
+    if (sort.col !== col) return <ArrowUpDown size={10} className="opacity-40" />;
+    return sort.dir === "asc" ? <ArrowUp size={10} /> : <ArrowDown size={10} />;
+  };
 
   const summary = useMemo(() => {
     return rows.reduce(
@@ -123,14 +149,14 @@ export default function Expiry() {
             <table className="w-full font-mono text-xs" data-testid="expiry-table">
               <thead className="bg-[#0a0a0a] sticky top-0 z-10">
                 <tr className="text-left text-[10px] uppercase tracking-wider text-[#6b7280]">
-                  <th className="px-4 py-2">Vendor</th>
-                  <th className="px-4 py-2">Feature</th>
-                  <th className="px-4 py-2">Server</th>
-                  <th className="px-4 py-2">Version</th>
-                  <th className="px-4 py-2 text-right">Seats</th>
-                  <th className="px-4 py-2">Expires</th>
-                  <th className="px-4 py-2 text-right">Days</th>
-                  <th className="px-4 py-2 text-right">Status</th>
+                  <ExTh col="vendor" label="Vendor" onClick={toggleSort} icon={sortIcon} />
+                  <ExTh col="feature" label="Feature" onClick={toggleSort} icon={sortIcon} />
+                  <ExTh col="server_name" label="Server" onClick={toggleSort} icon={sortIcon} />
+                  <ExTh col="version" label="Version" onClick={toggleSort} icon={sortIcon} />
+                  <ExTh col="total" label="Seats" onClick={toggleSort} icon={sortIcon} align="right" />
+                  <ExTh col="expires" label="Expires" onClick={toggleSort} icon={sortIcon} />
+                  <ExTh col="days_remaining" label="Days" onClick={toggleSort} icon={sortIcon} align="right" />
+                  <ExTh col="status" label="Status" onClick={toggleSort} icon={sortIcon} align="right" />
                 </tr>
               </thead>
               <tbody>
@@ -191,4 +217,17 @@ const Tile = ({ label, n, color }) => (
       {n}
     </span>
   </div>
+);
+
+const ExTh = ({ col, label, onClick, icon, align }) => (
+  <th
+    className={`px-4 py-2 cursor-pointer select-none hover:text-white ${align === "right" ? "text-right" : ""}`}
+    onClick={() => onClick(col)}
+    data-testid={`expiry-sort-${col}`}
+  >
+    <span className={`inline-flex items-center gap-1.5 ${align === "right" ? "justify-end" : ""}`}>
+      {label}
+      {icon(col)}
+    </span>
+  </th>
 );

@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard, LogOut, Users as UsersIcon, Shield, User as UserIcon } from "lucide-react";
+import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard, LogOut, Users as UsersIcon, Shield, User as UserIcon, BarChart3, Globe } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+import { fmtClock } from "@/lib/api";
+import { prefs } from "@/lib/prefs";
 
 export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
   const [time, setTime] = useState(new Date());
+  const [tz, setTz] = useState(prefs.load().tz || "IST");
   const loc = useLocation();
   const nav = useNavigate();
   const { user, isAdmin, logout } = useAuth();
@@ -14,8 +17,17 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
     return () => clearInterval(t);
   }, []);
 
+  const toggleTz = () => {
+    const nv = tz === "IST" ? "UTC" : "IST";
+    setTz(nv);
+    prefs.save({ tz: nv });
+    // Notify other mounted components that read prefs.tz on render
+    window.dispatchEvent(new CustomEvent("licman:tz", { detail: nv }));
+  };
+
   const navLinks = [
     { to: "/", label: "CONTROL ROOM", icon: LayoutDashboard, test: "nav-dashboard", show: true },
+    { to: "/usage", label: "USAGE", icon: BarChart3, test: "nav-usage", show: true },
     { to: "/expiry", label: "EXPIRY", icon: Calendar, test: "nav-expiry", show: true },
     { to: "/users", label: "USERS", icon: UsersIcon, test: "nav-users", show: isAdmin },
     { to: "/settings", label: "SETTINGS", icon: SettingsIcon, test: "nav-settings", show: isAdmin },
@@ -75,10 +87,16 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
             <Stat label="FEAT" value={stats?.features_total ?? 0} />
             <Stat label="CHK-OUT" value={stats?.checkouts_active ?? 0} accent="#3b82f6" />
             <Stat label="RES" value={stats?.reservations ?? 0} accent="#f59e0b" />
-            <div className="text-[#6b7280]">
-              <span className="text-[#9ca3af]">UTC </span>
-              <span className="text-[#f3f4f6]">{time.toISOString().slice(11, 19)}</span>
-            </div>
+            <button
+              onClick={toggleTz}
+              className="text-[#6b7280] hover:text-emerald-400 flex items-center gap-1.5 font-mono"
+              data-testid="tz-toggle"
+              title="Click to switch UTC ↔ IST"
+            >
+              <Globe size={11} />
+              <span className="text-[#9ca3af]">{tz} </span>
+              <span className="text-[#f3f4f6] tabular-nums">{fmtClock(time, tz)}</span>
+            </button>
           </div>
 
           {/* Actions */}
