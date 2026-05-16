@@ -68,6 +68,21 @@ if ! grep -E '^JWT_SECRET=.+' .env >/dev/null 2>&1; then
     echo "[*] Generated random JWT_SECRET (stored in .env)"
 fi
 
+# Auto-generate FERNET_KEY for at-rest encryption of SSH keys & SMTP passwords
+if ! grep -E '^FERNET_KEY=.+' .env >/dev/null 2>&1; then
+    NEW_FERNET=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" 2>/dev/null \
+                 || (openssl rand -base64 32 | tr -d '=' | tr '+/' '-_'))
+    if grep -q '^FERNET_KEY=' .env; then
+        sed -i "s|^FERNET_KEY=.*|FERNET_KEY=${NEW_FERNET}|" .env
+    else
+        echo "FERNET_KEY=${NEW_FERNET}" >> .env
+    fi
+    echo "[*] Generated random FERNET_KEY (stored in .env)"
+fi
+
+# Make .env readable only by root — it now contains secrets
+chmod 600 .env
+
 # --------------- 3. Self-signed cert ---------------
 mkdir -p nginx/ssl ssh_keys
 if [[ ! -f nginx/ssl/server.crt || ! -f nginx/ssl/server.key ]]; then
@@ -115,6 +130,17 @@ if [[ ! -f /etc/systemd/system/licman.service ]]; then
     sed -i "s|/opt/licman/deploy|$DEPLOY_DIR|g" /etc/systemd/system/licman.service
     systemctl daemon-reload
     systemctl enable licman.service >/dev/null
+fi
+
+# --------------- 7b. Weekly backup timer ---------------
+if [[ -f licman-backup.service && -f licman-backup.timer ]]; then
+    install -d -m 700 /var/backups/licman
+    cp licman-backup.service /etc/systemd/system/licman-backup.service
+    cp licman-backup.timer   /etc/systemd/system/licman-backup.timer
+    sed -i "s|/opt/licman/deploy|$DEPLOY_DIR|g" /etc/systemd/system/licman-backup.service
+    systemctl daemon-reload
+    systemctl enable --now licman-backup.timer >/dev/null 2>&1 || true
+    echo "[*] Weekly backup timer enabled → /var/backups/licman"
 fi
 
 # --------------- 8. Smoke test ---------------

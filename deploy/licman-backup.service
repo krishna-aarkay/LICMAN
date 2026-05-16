@@ -1,0 +1,9 @@
+[Unit]
+Description=LICMAN MongoDB rotating backup
+After=licman.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /opt/licman/deploy/backup.sh
+StandardOutput=journal
+StandardError=journal

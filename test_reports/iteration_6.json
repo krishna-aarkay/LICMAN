@@ -1,0 +1,65 @@
+{
+  "summary": "Iteration 6 production hardening pass — 18/18 new iteration-6 tests PASS, 27/27 prior iteration-4 auth regression tests PASS. Verified Fernet encryption at rest (DB values prefixed 'enc::v1::'), API redaction of ssh.password/private_key and smtp_password, masked-roundtrip preservation, /api/health (no DB) and /api/ready (DB ping), MongoDB indexes (servers.id unique + vendor, checkouts.server_id, reservations.server_id, alert_events.timestamp DESC, audit TTL on 'ts'), audit log query excludes internal 'ts' field, auto-sync loop started (log line confirmed in backend stderr). One real production-hardening bug found: _set_auth_cookies() hardcodes secure=False so COOKIE_SECURE env is honored ONLY by /auth/refresh — login/setup cookies will never get the Secure flag even when COOKIE_SECURE=true.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/auth/login, POST /api/auth/setup",
+        "issue": "_set_auth_cookies() (server.py:813-816) hardcodes secure=False. It ignores the COOKIE_SECURE env var entirely. Only the /auth/refresh endpoint (server.py:972-974) reads COOKIE_SECURE. Verified live: curl POST /api/auth/login returns Set-Cookie for access_token and refresh_token WITHOUT the Secure flag (HttpOnly + SameSite=lax only). This defeats the whole point of the COOKIE_SECURE iteration-6 feature on HTTPS deployments — initial login cookies remain non-Secure.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "GET /api/audit",
+        "issue": "Query uses projection {'_id': 0, 'ts': 0} but does not exclude potentially leaked future internal fields. Currently safe — 'ts' is hidden correctly. No action needed."
+      },
+      {
+        "endpoint": "Startup",
+        "issue": "db.audit.drop_indexes() is called unconditionally on every startup before recreating indexes. This works but slightly impacts cold-start; consider only recreating the TTL index when AUDIT_TTL_DAYS changes."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration6.py",
+    "/app/test_reports/pytest/iteration6.xml",
+    "/app/test_reports/pytest/iteration6_regression_iter4.xml"
+  ],
+  "action_items": [
+    "FIX (HIGH): Update _set_auth_cookies() at server.py:813-816 to read COOKIE_SECURE env var (same pattern as /auth/refresh line 972). Currently the common dict hardcodes secure=False — this nullifies COOKIE_SECURE for login/setup endpoints. Suggested fix:\n```\ndef _set_auth_cookies(response: Response, access: str, refresh: str):\n    secure = os.environ.get('COOKIE_SECURE', 'false').lower() in ('1','true','yes')\n    common = dict(httponly=True, samesite='lax', secure=secure, path='/')\n    response.set_cookie('access_token',  access,  max_age=ACCESS_TOKEN_MINUTES * 60, **common)\n    response.set_cookie('refresh_token', refresh, max_age=REFRESH_TOKEN_DAYS * 86400, **common)\n```",
+    "NIT: Factor COOKIE_SECURE resolution into a single helper (e.g. _cookie_secure()) instead of duplicating the env read in _set_auth_cookies and auth_refresh."
+  ],
+  "critical_code_review_comments": [
+    "HIGH: _set_auth_cookies (server.py:813) hardcodes secure=False; COOKIE_SECURE env is only honored in /auth/refresh. This is the main thing iteration-6 was supposed to add and it leaks on the primary auth path.",
+    "server.py is now 1683 lines — far exceeds the 700-line guideline. Time to split: /app/backend/auth.py (login/setup/refresh/logout + bcrypt + JWT + cookies), /app/backend/crypto.py (Fernet + redaction), /app/backend/scheduler.py (periodic_sync_loop), /app/backend/db_indexes.py (startup index creation).",
+    "Fernet key derivation falls back to sha256 of the passphrase if Fernet(key) raises. This is fine but undocumented — note in env.example that FERNET_KEY may be either a real urlsafe-b64 32-byte Fernet key OR a passphrase of any length (will be SHA-256-derived).",
+    "decrypt_secret() returns '' on InvalidToken — this silently masks key rotation problems. Should log a warning so operators can spot a Fernet key mismatch in production.",
+    "encrypt_secret() is idempotent (skips re-encrypt if value already starts with 'enc::v1::'). Good. But there's no migration path for plaintext-at-rest values left over from before iteration 6. Recommend a one-time migration helper or document that existing DBs need rotation.",
+    "Auto-sync loop uses await asyncio.sleep(interval) AFTER processing; if processing takes longer than interval, intervals drift. Acceptable for SSH sync. Loop correctly catches per-server and per-iteration exceptions — won't crash.",
+    "MongoDB index creation is done in startup_event without a try/except wrapper. If a duplicate constraint fails (e.g. existing dup user emails after a bad seed), the whole app will fail to start. Consider wrapping each create_index in try/except + warning log.",
+    "Audit doc inserts both 'timestamp' (ISO string) and 'ts' (BSON Date) — duplication is fine but TTL only acts on docs that have a 'ts' field. Old audit docs from prior iterations have no 'ts' so will never expire. Document or run a one-time backfill.",
+    "/api/health and /api/ready are correctly on public_router (no auth). /api/ready returns 503 on DB failure — good for k8s readiness probes.",
+    "Encryption-at-rest covers ssh.password, ssh.private_key, smtp_password. Other secrets (license file content, JWT_SECRET in .env) are not encrypted — acceptable since JWT_SECRET is at-rest only via .env file (chmod 600 by installer)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration6.py (new — 18 tests)",
+    "/app/backend/tests/conftest.py (rewritten to support asyncio markers)",
+    "/app/test_reports/pytest/iteration6.xml (new)",
+    "/app/test_reports/pytest/iteration6_regression_iter4.xml (new)",
+    "/app/test_reports/iteration_6.json (new)"
+  ],
+  "success_rate": {
+    "backend": "45/45 (100%) — 18/18 iteration-6 new tests + 27/27 iteration-4 auth regression",
+    "frontend": "N/A — backend-only testing requested"
+  },
+  "test_credentials": "admin@example.com / adminpass123 (verified login works, role=admin)",
+  "seed_data_creation": "Reused existing seeded servers; PUT /servers/{id}/ssh and PUT /settings were used to write+verify Fernet-encrypted secrets in DB via direct motor inspection. No new persistent users created.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 6 backend is fully green except for the COOKIE_SECURE login-path bug. After main agent applies the _set_auth_cookies fix, re-run `pytest /app/backend/tests/test_iteration6.py /app/backend/tests/test_iteration4_auth.py -v --junitxml=/app/test_reports/pytest/iteration7.xml` and manually verify with `COOKIE_SECURE=true` env that login Set-Cookie now contains Secure flag. Backend URL: https://eda-license-portal.preview.emergentagent.com. MONGO_URL=mongodb://localhost:27017 DB_NAME=test_database. FERNET_KEY already provisioned in /app/backend/.env. Direct DB inspection used motor; tests verified enc::v1:: prefix on ssh.password and smtp_password. Auto-sync loop confirmed via 'Auto-sync loop started — interval 60s' in /var/log/supervisor/backend.err.log.",
+  "rca_of_the_issue": "Bug RCA: server.py:813 `def _set_auth_cookies(response, access, refresh): common = dict(httponly=True, samesite='lax', secure=False, path='/')`. The `secure=False` is a literal, not a variable lookup. Iteration 6 added COOKIE_SECURE env handling but only patched the /auth/refresh endpoint at line 972 — the primary login + setup path which uses _set_auth_cookies was missed. Reproduction: curl -i POST /api/auth/login → Set-Cookie for access_token has only `HttpOnly; SameSite=lax`, no `Secure`. Mitigation: replace `secure=False` with `secure=os.environ.get('COOKIE_SECURE','false').lower() in ('1','true','yes')`; ideally factor into a helper used by both _set_auth_cookies and auth_refresh."
+}

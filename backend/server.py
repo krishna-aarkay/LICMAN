@@ -180,7 +180,10 @@ async def log_audit(action: str, detail: str, server_id: Optional[str] = None,
         action=action, detail=detail, server_id=server_id,
         server_name=server_name, severity=severity  # type: ignore
     )
-    await db.audit.insert_one(entry.model_dump())
+    doc = entry.model_dump()
+    # Add a real BSON Date for the TTL index
+    doc["ts"] = datetime.now(timezone.utc)
+    await db.audit.insert_one(doc)
 
 
 def _sample_users():
@@ -258,11 +261,13 @@ def days_until(d: Optional[date]) -> Optional[int]:
 
 
 # ---------- SMTP / Alerts ----------
-async def get_alert_settings() -> dict:
+async def get_alert_settings(*, decrypt_smtp: bool = True) -> dict:
     doc = await db.settings.find_one({"_key": "alerts"}, {"_id": 0})
     if not doc:
         return AlertSettings().model_dump()
     doc.pop("_key", None)
+    if decrypt_smtp and doc.get("smtp_password"):
+        doc["smtp_password"] = decrypt_secret(doc["smtp_password"])
     return doc
 
 
@@ -357,6 +362,16 @@ except Exception:
     PARAMIKO_AVAILABLE = False
 
 
+def _ssh_with_decrypted(ssh: dict) -> dict:
+    """Return a copy of an ssh dict with password/private_key decrypted for paramiko use."""
+    if not isinstance(ssh, dict):
+        return ssh
+    out = dict(ssh)
+    out["password"] = decrypt_secret(out.get("password", ""))
+    out["private_key"] = decrypt_secret(out.get("private_key", ""))
+    return out
+
+
 def _ssh_real_exec(ssh_cfg: dict, command: str) -> dict:
     """Execute a command on a remote host via paramiko. Returns dict with stdout/stderr/exit."""
     if not PARAMIKO_AVAILABLE:
@@ -410,7 +425,7 @@ async def ssh_execute(server: dict, command: str) -> dict:
     mode = server.get("adapter_mode", "mock")
     ssh = server.get("ssh", {}) or {}
     if mode == "ssh" and ssh.get("enabled"):
-        return await asyncio.to_thread(_ssh_real_exec, ssh, command)
+        return await asyncio.to_thread(_ssh_real_exec, _ssh_with_decrypted(ssh), command)
     return {"mode": "mock", "command": command, "output": f"[MOCK] {command} executed", "exit": 0}
 
 
@@ -512,11 +527,12 @@ async def _real_checkouts_via_ssh(server: dict) -> Optional[dict]:
     ssh = server.get("ssh", {}) or {}
     if not (ssh.get("enabled") and PARAMIKO_AVAILABLE):
         return None
+    decrypted = _ssh_with_decrypted(ssh)
     lmutil = ssh.get("lmutil_path") or "lmutil"
     cmd = f"{lmutil} lmstat -a -c {server['port']}@{server['host']}"
-    res = await asyncio.to_thread(_ssh_real_exec, ssh, cmd)
+    res = await asyncio.to_thread(_ssh_real_exec, decrypted, cmd)
     if res.get("exit") != 0 or not res.get("output"):
-        logger.warning(f"lmstat ssh failed on {server['name']}: {res.get('output')[:200]}")
+        logger.warning(f"lmstat ssh failed on {server['name']}: {res.get('output', '')[:200]}")
         return None
     return parse_lmstat_a(res["output"], server["id"])
 
@@ -629,6 +645,76 @@ async def seed_if_empty():
         )
         await db.servers.insert_one(server.model_dump())
         await log_audit("SEED", f"Seeded server {s['name']}", server.id, s["name"], "info")
+
+
+# ---------- Secret encryption at rest (Fernet) ----------
+from cryptography.fernet import Fernet, InvalidToken
+import base64 as _b64
+import hashlib as _hashlib
+
+_ENC_PREFIX = "enc::v1::"
+
+
+def _fernet() -> Optional[Fernet]:
+    key = os.environ.get("FERNET_KEY", "").strip()
+    if not key:
+        return None
+    # Accept either a real Fernet urlsafe-b64 key or a long passphrase (derive).
+    try:
+        return Fernet(key.encode("utf-8"))
+    except Exception:
+        derived = _b64.urlsafe_b64encode(_hashlib.sha256(key.encode("utf-8")).digest())
+        return Fernet(derived)
+
+
+def encrypt_secret(value: str) -> str:
+    if not value:
+        return ""
+    if value.startswith(_ENC_PREFIX):
+        return value
+    f = _fernet()
+    if f is None:
+        return value
+    return _ENC_PREFIX + f.encrypt(value.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_secret(value: str) -> str:
+    if not value or not isinstance(value, str):
+        return value or ""
+    if not value.startswith(_ENC_PREFIX):
+        return value
+    f = _fernet()
+    if f is None:
+        return ""
+    try:
+        return f.decrypt(value[len(_ENC_PREFIX):].encode("utf-8")).decode("utf-8")
+    except InvalidToken:
+        return ""
+
+
+def _redact_ssh_for_client(ssh: dict) -> dict:
+    """Return a copy of an ssh config dict with secret fields masked for API responses."""
+    if not isinstance(ssh, dict):
+        return ssh
+    out = dict(ssh)
+    if out.get("password"):
+        out["password"] = "" if not out["password"] else "********"
+    if out.get("private_key"):
+        out["private_key"] = "********"
+    return out
+
+
+def _redact_smtp_for_client(cfg: dict) -> dict:
+    out = dict(cfg)
+    if out.get("smtp_password"):
+        out["smtp_password"] = "********"
+        out["smtp_password_set"] = True
+    else:
+        out["smtp_password_set"] = False
+    return out
+
+
+# ---------- end Fernet ----------
 
 
 # ------------------------- AUTH (JWT + bcrypt) -------------------------
@@ -883,8 +969,9 @@ async def auth_refresh(request: Request, response: Response):
     except pyjwt.InvalidTokenError:
         raise HTTPException(401, "Invalid refresh token")
     access = create_access_token(user)
+    secure = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
     response.set_cookie("access_token", access, max_age=ACCESS_TOKEN_MINUTES * 60,
-                        httponly=True, samesite="lax", secure=False, path="/")
+                        httponly=True, samesite="lax", secure=secure, path="/")
     return {"access_token": access, "user": _user_public(user)}
 
 
@@ -978,6 +1065,22 @@ async def root():
     return {"service": "LICMAN", "status": "ok"}
 
 
+@public_router.get("/health")
+async def health():
+    """Liveness — process responds, doesn't touch the database."""
+    return {"status": "ok"}
+
+
+@public_router.get("/ready")
+async def ready():
+    """Readiness — verifies the DB is reachable."""
+    try:
+        await db.command("ping")
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(503, f"db unreachable: {e}")
+
+
 @public_router.get("/setup-status")
 async def setup_status():
     count = await db.users.count_documents({})
@@ -987,6 +1090,8 @@ async def setup_status():
 @api_router.get("/servers", response_model=List[LicenseServer])
 async def list_servers():
     docs = await db.servers.find({}, {"_id": 0}).to_list(500)
+    for d in docs:
+        d["ssh"] = _redact_ssh_for_client(d.get("ssh", {}))
     return docs
 
 
@@ -1010,6 +1115,7 @@ async def get_server(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
+    doc["ssh"] = _redact_ssh_for_client(doc.get("ssh", {}))
     return doc
 
 
@@ -1155,14 +1261,34 @@ async def all_checkouts():
 
 @api_router.put("/servers/{server_id}/ssh", response_model=LicenseServer)
 async def save_ssh_config(server_id: str, payload: SshConfig, _: dict = Depends(require_admin)):
+    cfg = payload.model_dump()
+    # If client sends masked secrets, preserve existing stored values
+    existing = await db.servers.find_one({"id": server_id}, {"_id": 0, "ssh": 1})
+    if existing and existing.get("ssh"):
+        old = existing["ssh"]
+        if cfg.get("password") in ("", "********"):
+            cfg["password"] = old.get("password", "")
+        else:
+            cfg["password"] = encrypt_secret(cfg["password"])
+        if cfg.get("private_key") in ("", "********"):
+            cfg["private_key"] = old.get("private_key", "")
+        else:
+            cfg["private_key"] = encrypt_secret(cfg["private_key"])
+    else:
+        if cfg.get("password"):
+            cfg["password"] = encrypt_secret(cfg["password"])
+        if cfg.get("private_key"):
+            cfg["private_key"] = encrypt_secret(cfg["private_key"])
     res = await db.servers.find_one_and_update(
-        {"id": server_id}, {"$set": {"ssh": payload.model_dump()}},
+        {"id": server_id}, {"$set": {"ssh": cfg}},
         return_document=True, projection={"_id": 0}
     )
     if not res:
         raise HTTPException(404, "Server not found")
     await log_audit("SSH_CONFIG", f"SSH config updated for {res['name']} (host={payload.host})",
                     server_id, res["name"], "info")
+    # Redact for response
+    res["ssh"] = _redact_ssh_for_client(res.get("ssh", {}))
     return res
 
 
@@ -1308,21 +1434,29 @@ async def expiry_calendar(warn_days: int = 90):
 
 @api_router.get("/settings")
 async def get_settings():
-    return await get_alert_settings()
+    cfg = await get_alert_settings(decrypt_smtp=False)
+    return _redact_smtp_for_client(cfg)
 
 
 @api_router.put("/settings")
 async def put_settings(payload: AlertSettings, _: dict = Depends(require_admin)):
     data = payload.model_dump()
+    existing = await db.settings.find_one({"_key": "alerts"}, {"_id": 0}) or {}
+    # Preserve existing encrypted password if client sent masked value
+    if data.get("smtp_password") in ("", "********"):
+        data["smtp_password"] = existing.get("smtp_password", "")
+    else:
+        data["smtp_password"] = encrypt_secret(data["smtp_password"])
     data["_key"] = "alerts"
     await db.settings.update_one({"_key": "alerts"}, {"$set": data}, upsert=True)
-    await log_audit("SETTINGS_SAVE", f"Alert settings updated (enabled={payload.enabled}, recipients={len(payload.to_addresses)})",
-                    None, None, "info")
-    out = data.copy()
+    await log_audit(
+        "SETTINGS_SAVE",
+        f"Alert settings updated (enabled={payload.enabled}, recipients={len(payload.to_addresses)})",
+        None, None, "info",
+    )
+    out = dict(data)
     out.pop("_key", None)
-    out.pop("smtp_password", None)
-    out["smtp_password_set"] = bool(payload.smtp_password)
-    return out
+    return _redact_smtp_for_client(out)
 
 
 @api_router.post("/settings/test-email")
@@ -1397,7 +1531,7 @@ async def delete_reservation(rid: str):
 
 @api_router.get("/audit", response_model=List[AuditLog])
 async def audit(limit: int = 50):
-    docs = await db.audit.find({}, {"_id": 0}).sort("timestamp", -1).to_list(limit)
+    docs = await db.audit.find({}, {"_id": 0, "ts": 0}).sort("timestamp", -1).to_list(limit)
     return docs
 
 
@@ -1464,15 +1598,85 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------- Background auto-sync scheduler ----------
+
+_sync_task: Optional[asyncio.Task] = None
+
+
+async def _periodic_sync_loop():
+    """Periodically run lmstat sync for every server with adapter_mode='ssh' and ssh.enabled."""
+    interval = int(os.environ.get("SYNC_INTERVAL_SECONDS", "60"))
+    if interval <= 0:
+        logger.info("Auto-sync disabled (SYNC_INTERVAL_SECONDS=0)")
+        return
+    logger.info(f"Auto-sync loop started — interval {interval}s")
+    while True:
+        try:
+            servers = await db.servers.find(
+                {"adapter_mode": "ssh", "ssh.enabled": True}, {"_id": 0}
+            ).to_list(500)
+            for srv in servers:
+                try:
+                    parsed = await _real_checkouts_via_ssh(srv)
+                    if parsed is None:
+                        continue
+                    update: dict = {"last_sync": datetime.now(timezone.utc).isoformat()}
+                    if parsed["features"]:
+                        update["features"] = parsed["features"]
+                    await db.servers.update_one({"id": srv["id"]}, {"$set": update})
+                    await db.checkouts.delete_many({"server_id": srv["id"]})
+                    if parsed["checkouts"]:
+                        await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+                except Exception as e:
+                    logger.warning(f"auto-sync failed for {srv.get('name')}: {e}")
+            try:
+                await evaluate_alerts()
+            except Exception as e:
+                logger.warning(f"auto-sync alerts pass failed: {e}")
+        except Exception as e:
+            logger.warning(f"auto-sync iteration error: {e}")
+        await asyncio.sleep(interval)
+
+
+# ---------- end scheduler ----------
+
+
 @app.on_event("startup")
 async def startup_event():
-    # Indexes for auth
+    global _sync_task
+    # Indexes: auth
     await db.users.create_index("email", unique=True)
     await db.users.create_index("id", unique=True)
     await db.login_attempts.create_index("identifier")
+    # Indexes: data
+    await db.servers.create_index("id", unique=True)
+    await db.servers.create_index("vendor")
+    await db.checkouts.create_index("server_id")
+    await db.reservations.create_index("server_id")
+    await db.alert_events.create_index([("timestamp", -1)])
+    # Audit TTL — auto-delete entries older than AUDIT_TTL_DAYS (default 90 days)
+    ttl_days = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
+    try:
+        await db.audit.drop_indexes()
+    except Exception:
+        pass
+    # Note: TTL needs a real BSON Date, not a string. We add a `ts` field on inserts via a wrapper.
+    await db.audit.create_index([("timestamp", -1)])
+    await db.audit.create_index("ts", expireAfterSeconds=ttl_days * 86400)
+    # Seed if applicable
     await seed_if_empty()
+    # Start auto-sync loop
+    if os.environ.get("SYNC_INTERVAL_SECONDS", "60") != "0":
+        _sync_task = asyncio.create_task(_periodic_sync_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    global _sync_task
+    if _sync_task and not _sync_task.done():
+        _sync_task.cancel()
+        try:
+            await _sync_task
+        except (asyncio.CancelledError, Exception):
+            pass
     client.close()
