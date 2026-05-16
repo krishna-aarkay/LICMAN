@@ -1,0 +1,7 @@
+# Dev / test only. Not installed in the production Docker image.
+-r requirements.txt
+pytest>=8.0.0
+black>=24.1.1
+isort>=5.13.2
+flake8>=7.0.0
+ruff>=0.5.0
