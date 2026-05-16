@@ -3,6 +3,8 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "sonner";
 import Dashboard from "@/pages/Dashboard";
 import ServerDetail from "@/pages/ServerDetail";
+import Settings from "@/pages/Settings";
+import Expiry from "@/pages/Expiry";
 
 function App() {
   return (
@@ -11,6 +13,8 @@ function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/servers/:id" element={<ServerDetail />} />
+          <Route path="/expiry" element={<Expiry />} />
+          <Route path="/settings" element={<Settings />} />
         </Routes>
       </BrowserRouter>
       <Toaster

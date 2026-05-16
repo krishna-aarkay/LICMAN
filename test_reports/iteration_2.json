@@ -1,0 +1,50 @@
+{
+  "summary": "Iteration 2 testing of LICMAN new features (SSH adapter, SMTP alerts, Expiry, localStorage persistence). Backend: 16/16 NEW pytests PASSED + 13/13 prior pytests still green (total 29/29). All new endpoints verified: GET/PUT /api/settings (with smtp_password masking + smtp_password_set), POST /api/settings/test-email (400 when unconfigured, returns {ok,error} when SMTP unreachable, logs AlertEvent kind=test), GET /api/alerts (sorted desc), POST /api/alerts/evaluate (creates saturation alerts), GET /api/expiry (sorted expired->nearest->permanent, status field), PUT /api/servers/{id}/ssh (persists SshConfig), PUT /api/servers/{id}/adapter (mock/ssh + 422 on invalid), POST /api/servers/{id}/ssh/test ({ok,message,mocked:true}), reread/restart record exec_log mode in last_action, /api/checkouts triggers evaluate_alerts side-effect, /api/seed/reset clears alert_events. Frontend: Header has 3 nav links (nav-dashboard/nav-expiry/nav-settings), localStorage 'licman_prefs_v1' persists autoRefresh/vendorFilter/searchQuery/lastServerId correctly, /expiry page renders summary tiles + filters + sorted table with color-coded ExpiryBadge per row, /settings page renders complete SMTP form + O365 preset + alert toggles + Recent Alerts panel. CRITICAL GAP: ServerDetail Connection tab (tab-ssh) is COMPLETELY MISSING — only 5 old tabs (checkouts/license/options/reservations/audit). SshConfigPanel is unreachable via UI. Feature cells on ServerDetail also lack ExpiryBadge with days-remaining (only show seat usage bars).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/settings/test-email", "issue": "SMTP delivery always fails in sandbox (no reachable mail server) — expected/mocked. Endpoint correctly returns 200 with ok=false, error=<smtp error> and logs an AlertEvent. No fix needed."},
+      {"endpoint": "POST /api/alerts/evaluate & GET /api/checkouts", "issue": "Saturation alert generation depends on random checkout simulation (random.randint up to total). Single evaluation may not fire; tests loop up to 10-15 times. Acceptable for mocked demo."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "ServerDetail", "issue": "Connection tab (tab-ssh) is COMPLETELY MISSING from ServerDetail page. Only 5 tabs render (tab-checkouts, tab-license, tab-options, tab-reservations, tab-audit). SshConfigPanel with adapter-mode toggle, ssh-host/port/username/lmutil/auth/private-key/password inputs and ssh-test-btn / ssh-save-btn is unreachable via UI. Backend endpoints work — just the UI tab+panel is not wired in.", "selector": "[data-testid='tab-ssh']", "priority": "CRITICAL"},
+      {"component": "ServerDetail feature cells", "issue": "Feature cells (feature-cell-Innovus, feature-cell-Genus, ...) show only seat usage bars (e.g., 8/8 red, 5/6 red, 7/12 amber). The required ExpiryBadge with days-remaining + color coding per the spec is NOT rendered inside feature cells.", "selector": "feature-cell-* > [data-testid^='expiry-badge']", "priority": "HIGH"},
+      {"component": "Expiry page", "issue": "Summary tiles render visually (EXPIRED 0, CRITICAL 0, WARN 9, OK 5, PERMANENT 0) but data-testid attributes are MISSING: expiry-summary-expired, expiry-summary-critical, expiry-summary-warning, expiry-summary-ok, expiry-summary-permanent. Also expiry-table testid missing on the table element. expiry-search IS present.", "selector": "expiry-summary-*, expiry-table", "priority": "MEDIUM"},
+      {"component": "Settings page", "issue": "STARTTLS toggle and the 3 alert toggles (master/saturation/expiry) render as visible ON/OFF / ENABLED/DISABLED buttons but lack the expected data-testids: starttls-toggle, alert-master-toggle, alert-saturation-toggle, alert-expiry-toggle. All other testids found (smtp-host, smtp-port, smtp-username, smtp-password, from-address, recipients, expiry-warn-days, o365-preset-btn, send-test-email-btn, save-settings-btn).", "selector": "starttls-toggle, alert-*-toggle", "priority": "MEDIUM"},
+      {"component": "Dashboard CheckoutTable", "issue": "Vendor filter chips use data-testid 'filter-vendor-ALL/cadence/synopsys/mentor' (not 'vendor-filter-all') and search input uses 'checkout-search' (not 'search-input'). Naming differs from review spec. Functional but inconsistent.", "selector": "filter-vendor-* vs vendor-filter-*, checkout-search vs search-input", "priority": "LOW"}
+    ],
+    "integration_issues": [
+      {"flow": "SSH config save / adapter toggle / ssh-test", "issue": "Entire SSH config flow cannot be exercised through the UI because the tab-ssh + SshConfigPanel are not rendered in ServerDetail. Backend APIs (PUT /ssh, PUT /adapter, POST /ssh/test) all work fine (verified via pytest).", "affected_selectors": ["tab-ssh", "ssh-host", "ssh-save-btn", "ssh-test-btn", "adapter-mode-mock", "adapter-mode-ssh"]}
+    ],
+    "design_issues": [
+      {"screen": "Overall", "issues": ["Cyberpunk/terminal aesthetic is consistent; Expiry page colour-coded badges (45D amber, 137D green, 229D green) render clearly; Settings page two-column layout is readable; no contrast issues spotted on 1920x1080."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_new_features.py", "/app/backend/tests/backend_test.py", "/app/test_reports/pytest/new_features.xml"],
+  "action_items": [
+    "CRITICAL: Render SSH 'Connection' tab + SshConfigPanel inside ServerDetail. Add data-testid='tab-ssh' to the new tab trigger and the panel must contain: adapter-mode-mock, adapter-mode-ssh, ssh-host, ssh-port, ssh-username, ssh-lmutil, ssh-auth-key, ssh-auth-password, ssh-private-key (textarea, key mode) OR ssh-password (input, password mode), ssh-test-btn, ssh-save-btn. The component file /app/frontend/src/components/SshConfigPanel.jsx exists per review request — verify it's imported and mounted under a new TabsTrigger inside ServerDetail.jsx.",
+    "HIGH: Add ExpiryBadge to ServerDetail feature cells. Each feature-cell-* should include <ExpiryBadge expires={feature.expires} /> showing days_remaining with color (red expired/critical, amber warning, green ok, neutral permanent).",
+    "MEDIUM: Add missing data-testids on Expiry page summary tiles (expiry-summary-expired/critical/warning/ok/permanent) and on the table element (expiry-table).",
+    "MEDIUM: Add data-testids on Settings page toggles: starttls-toggle, alert-master-toggle, alert-saturation-toggle, alert-expiry-toggle.",
+    "LOW: Align CheckoutTable testid naming with spec (or update spec) — currently filter-vendor-ALL/checkout-search vs requested vendor-filter-all/search-input."
+  ],
+  "critical_code_review_comments": [
+    "server.py now ~857 lines — over the 700-line guideline. Consider splitting into modules: models.py, helpers.py (smtp/alerts/ssh), routes_servers.py, routes_settings.py, routes_expiry.py.",
+    "send_smtp_email is synchronous and runs inside an async endpoint; under load this will block the event loop. Wrap with asyncio.to_thread(..) or use aiosmtplib.",
+    "SMTP password is stored in plaintext in MongoDB settings collection. Acceptable for single-user demo but should be encrypted-at-rest for prod.",
+    "_alert_throttled uses string ISO comparison on timestamps which works for UTC ISO strings but is fragile if timezone-aware/naive mix ever leaks in.",
+    "evaluate_alerts re-generates random checkouts via generate_checkouts() — saturation alerts are non-deterministic. Production swap should pull live lmstat data.",
+    "PUT /settings response strips smtp_password and adds smtp_password_set — good. But GET /settings still returns the raw password from DB. Consider masking on GET as well.",
+    "AdapterPayload doesn't validate adapter_mode='ssh' requires ssh.enabled=True — user can put adapter=ssh while ssh.enabled=False, then ssh_execute falls back to mock silently."
+  ],
+  "updated_files": ["/app/backend/tests/test_new_features.py", "/app/test_reports/iteration_2.json", "/app/test_reports/pytest/new_features.xml"],
+  "success_rate": {"backend": "100% (16/16 new + 13/13 prior = 29/29)", "frontend": "~70% — Dashboard prefs persistence, Expiry page, Settings page all work visually; ServerDetail SSH Connection tab is MISSING entirely; feature cell ExpiryBadge missing; several data-testid gaps."},
+  "test_credentials": "N/A (no auth)",
+  "seed_data_creation": "Used POST /api/seed/reset before each test class to ensure clean 3-server seed + empty alert_events.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend is fully green (29/29). Next iteration should re-verify after main agent adds: (1) tab-ssh + SshConfigPanel mount in ServerDetail.jsx — THIS IS THE BIGGEST GAP, (2) ExpiryBadge inside feature cells on ServerDetail, (3) missing data-testids on Expiry summary tiles & Settings toggles. Public URL: https://eda-license-portal.preview.emergentagent.com. Backend test files: /app/backend/tests/backend_test.py (regression) and /app/backend/tests/test_new_features.py (new features).",
+  "rca of the issue": "ServerDetail.jsx is not importing/mounting the SshConfigPanel component (file exists at /app/frontend/src/components/SshConfigPanel.jsx per review request). Only the original 5 tabs are rendered. Same root cause for feature-cell ExpiryBadge — ExpiryBadge.jsx exists but is only used on the /expiry page, not inside ServerDetail's feature cells. Main agent must edit ServerDetail.jsx to: (a) add a new <TabsTrigger data-testid='tab-ssh'>CONNECTION</TabsTrigger> + matching <TabsContent> rendering <SshConfigPanel server={server} onUpdate={...} />, and (b) embed <ExpiryBadge expires={f.expires} /> in each feature-cell."
+}

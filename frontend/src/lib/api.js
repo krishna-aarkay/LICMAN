@@ -19,6 +19,10 @@ export const api = {
   reread: (id) => http.post(`/servers/${id}/reread`).then((r) => r.data),
   restart: (id) => http.post(`/servers/${id}/restart`).then((r) => r.data),
   toggle: (id) => http.post(`/servers/${id}/toggle`).then((r) => r.data),
+  saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
+  setAdapter: (id, mode) =>
+    http.put(`/servers/${id}/adapter`, { adapter_mode: mode }).then((r) => r.data),
+  testSsh: (id) => http.post(`/servers/${id}/ssh/test`).then((r) => r.data),
 
   // checkouts
   serverCheckouts: (id) => http.get(`/servers/${id}/checkouts`).then((r) => r.data),
@@ -37,6 +41,16 @@ export const api = {
     http.get(`/audit`, { params: { limit } }).then((r) => r.data),
   stats: () => http.get(`/stats`).then((r) => r.data),
   resetSeed: () => http.post(`/seed/reset`).then((r) => r.data),
+
+  // expiry / settings / alerts
+  expiry: (warn_days = 90) =>
+    http.get(`/expiry`, { params: { warn_days } }).then((r) => r.data),
+  getSettings: () => http.get(`/settings`).then((r) => r.data),
+  saveSettings: (data) => http.put(`/settings`, data).then((r) => r.data),
+  testEmail: () => http.post(`/settings/test-email`).then((r) => r.data),
+  listAlerts: (limit = 50) =>
+    http.get(`/alerts`, { params: { limit } }).then((r) => r.data),
+  evaluateAlerts: () => http.post(`/alerts/evaluate`).then((r) => r.data),
 };
 
 export const VENDOR_META = {

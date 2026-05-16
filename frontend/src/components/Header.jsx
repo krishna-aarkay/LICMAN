@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
-import { Activity, RotateCw, Terminal } from "lucide-react";
+import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard } from "lucide-react";
 
 export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
   const [time, setTime] = useState(new Date());
@@ -11,6 +11,12 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
     return () => clearInterval(t);
   }, []);
 
+  const navLinks = [
+    { to: "/", label: "CONTROL ROOM", icon: LayoutDashboard, test: "nav-dashboard" },
+    { to: "/expiry", label: "EXPIRY", icon: Calendar, test: "nav-expiry" },
+    { to: "/settings", label: "SETTINGS", icon: SettingsIcon, test: "nav-settings" },
+  ];
+
   return (
     <header
       className="border-b border-[#222] bg-[#0a0a0a] sticky top-0 z-30"
@@ -18,7 +24,7 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
     >
       <div className="relative grid-bg">
         <div className="absolute inset-0 bg-gradient-to-b from-transparent via-[#0a0a0a]/60 to-[#0a0a0a]" />
-        <div className="relative max-w-[1600px] mx-auto px-6 py-4 flex items-center justify-between gap-6">
+        <div className="relative max-w-[1600px] mx-auto px-6 py-4 flex items-center justify-between gap-6 flex-wrap">
           {/* Logo */}
           <Link to="/" className="flex items-center gap-3" data-testid="logo-link">
             <div className="w-9 h-9 border border-[#333] flex items-center justify-center bg-[#111]">
@@ -29,13 +35,33 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
                 LICMAN<span className="text-emerald-400 cursor-blink"></span>
               </div>
               <div className="font-mono text-[10px] text-[#6b7280] uppercase tracking-[0.25em]">
-                VLSI · LICENSE CONSOLE · v0.1
+                VLSI · LICENSE CONSOLE · v0.2
               </div>
             </div>
           </Link>
 
+          {/* Nav */}
+          <nav className="flex items-center gap-1 border border-[#222] bg-[#0a0a0a]">
+            {navLinks.map(({ to, label, icon: Icon, test }) => {
+              const active =
+                to === "/" ? loc.pathname === "/" || loc.pathname.startsWith("/servers/") : loc.pathname === to;
+              return (
+                <Link
+                  key={to}
+                  to={to}
+                  data-testid={test}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                    active ? "bg-white text-black" : "text-[#9ca3af] hover:text-white hover:bg-[#1a1a1a]"
+                  }`}
+                >
+                  <Icon size={11} /> {label}
+                </Link>
+              );
+            })}
+          </nav>
+
           {/* Stats strip */}
-          <div className="hidden md:flex items-center gap-6 font-mono text-[11px]">
+          <div className="hidden xl:flex items-center gap-5 font-mono text-[11px]">
             <Stat label="SRV" value={`${stats?.servers_up ?? 0}/${stats?.servers_total ?? 0}`} ok />
             <Stat label="FEAT" value={stats?.features_total ?? 0} />
             <Stat label="CHK-OUT" value={stats?.checkouts_active ?? 0} accent="#3b82f6" />
@@ -57,7 +83,7 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
               <Activity size={12} />
               {autoRefresh ? "LIVE" : "PAUSED"}
             </button>
-            {loc.pathname === "/" && (
+            {loc.pathname === "/" && onReset && (
               <button
                 onClick={onReset}
                 className="btn-brutal flex items-center gap-2"

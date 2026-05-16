@@ -1,13 +1,32 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
-import { ArrowLeft, FileText, Settings, ListChecks, Save, Plus, Trash2, RefreshCw, Power, Activity } from "lucide-react";
+import { ArrowLeft, FileText, Settings, ListChecks, Save, Plus, Trash2, RefreshCw, Power, Activity, Plug } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api, VENDOR_META, fmtAgo } from "@/lib/api";
+import { prefs } from "@/lib/prefs";
 import Header from "@/components/Header";
 import CodeEditor from "@/components/CodeEditor";
 import AuditTimeline from "@/components/AuditTimeline";
 import ReservationDialog from "@/components/ReservationDialog";
+import ExpiryBadge from "@/components/ExpiryBadge";
+import SshConfigPanel from "@/components/SshConfigPanel";
 import { toast } from "sonner";
+
+const parseExpiry = (s) => {
+  if (!s) return null;
+  const t = s.trim().toLowerCase();
+  if (["permanent", "0", "none"].includes(t)) return null;
+  const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+  const m1 = t.match(/^(\d{1,2})-([a-z]{3})-(\d{4})$/);
+  if (m1) {
+    const mi = months.indexOf(m1[2]);
+    if (mi >= 0) return new Date(parseInt(m1[3]), mi, parseInt(m1[1]));
+  }
+  const m2 = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m2) return new Date(parseInt(m2[1]), parseInt(m2[2]) - 1, parseInt(m2[3]));
+  return null;
+};
+const daysUntil = (d) => (d ? Math.floor((d - new Date()) / 86400000) : null);
 
 export default function ServerDetail() {
   const { id } = useParams();
@@ -20,8 +39,13 @@ export default function ServerDetail() {
   const [reservations, setReservations] = useState([]);
   const [audit, setAudit] = useState([]);
   const [resDialogOpen, setResDialogOpen] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(prefs.load().autoRefresh);
   const [stats, setStats] = useState(null);
+
+  // remember last visited server
+  useEffect(() => {
+    if (id) prefs.save({ lastServerId: id });
+  }, [id]);
 
   const load = useCallback(async () => {
     const s = await api.getServer(id);
@@ -113,7 +137,13 @@ export default function ServerDetail() {
       <Header
         stats={stats}
         autoRefresh={autoRefresh}
-        onToggleRefresh={() => setAutoRefresh((v) => !v)}
+        onToggleRefresh={() => {
+          setAutoRefresh((v) => {
+            const nv = !v;
+            prefs.save({ autoRefresh: nv });
+            return nv;
+          });
+        }}
       />
 
       <main className="max-w-[1600px] mx-auto px-6 py-6 space-y-6">
@@ -389,6 +419,10 @@ export default function ServerDetail() {
                 </table>
               </div>
             </div>
+          </TabsContent>
+
+          <TabsContent value="ssh" className="mt-4">
+            <SshConfigPanel server={server} onChange={load} />
           </TabsContent>
 
           <TabsContent value="audit" className="mt-4">

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Plus } from "lucide-react";
 import { api } from "@/lib/api";
+import { prefs } from "@/lib/prefs";
 import Header from "@/components/Header";
 import ServerCard from "@/components/ServerCard";
 import CheckoutTable from "@/components/CheckoutTable";
@@ -9,11 +10,12 @@ import AddServerDialog from "@/components/AddServerDialog";
 import { toast } from "sonner";
 
 export default function Dashboard() {
+  const initial = prefs.load();
   const [servers, setServers] = useState([]);
   const [checkouts, setCheckouts] = useState([]);
   const [audit, setAudit] = useState([]);
   const [stats, setStats] = useState(null);
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(initial.autoRefresh);
   const [addOpen, setAddOpen] = useState(false);
 
   const load = useCallback(async () => {
@@ -43,6 +45,14 @@ export default function Dashboard() {
     return () => clearInterval(t);
   }, [autoRefresh, load]);
 
+  const toggleRefresh = () => {
+    setAutoRefresh((v) => {
+      const nv = !v;
+      prefs.save({ autoRefresh: nv });
+      return nv;
+    });
+  };
+
   const handleReset = async () => {
     try {
       await api.resetSeed();
@@ -58,7 +68,7 @@ export default function Dashboard() {
       <Header
         stats={stats}
         autoRefresh={autoRefresh}
-        onToggleRefresh={() => setAutoRefresh((v) => !v)}
+        onToggleRefresh={toggleRefresh}
         onReset={handleReset}
       />
 

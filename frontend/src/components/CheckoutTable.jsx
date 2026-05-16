@@ -1,10 +1,16 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Search } from "lucide-react";
 import { fmtAgo, VENDOR_META } from "@/lib/api";
+import { prefs } from "@/lib/prefs";
 
 export const CheckoutTable = ({ rows, servers }) => {
-  const [q, setQ] = useState("");
-  const [vendorFilter, setVendorFilter] = useState("ALL");
+  const initial = prefs.load();
+  const [q, setQ] = useState(initial.searchQuery || "");
+  const [vendorFilter, setVendorFilter] = useState(initial.vendorFilter || "ALL");
+
+  useEffect(() => {
+    prefs.save({ vendorFilter, searchQuery: q });
+  }, [vendorFilter, q]);
 
   const serverMap = useMemo(() => {
     const m = {};

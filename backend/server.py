@@ -6,11 +6,16 @@ import os
 import logging
 import random
 import re
+import smtplib
+import ssl
+import asyncio
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional, Literal
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 
 ROOT_DIR = Path(__file__).parent
@@ -36,6 +41,17 @@ class FeatureModel(BaseModel):
     expires: str = "permanent"
 
 
+class SshConfig(BaseModel):
+    enabled: bool = False
+    host: str = ""
+    port: int = 22
+    username: str = ""
+    auth_method: Literal["password", "key"] = "key"
+    password: str = ""
+    private_key: str = ""
+    lmutil_path: str = "/usr/local/flexlm/lmutil"
+
+
 class LicenseServer(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -48,6 +64,8 @@ class LicenseServer(BaseModel):
     license_file: str = ""
     options_file: str = ""
     features: List[FeatureModel] = []
+    ssh: SshConfig = Field(default_factory=SshConfig)
+    adapter_mode: Literal["mock", "ssh"] = "mock"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     last_action: str = ""
 
@@ -104,6 +122,33 @@ class ReservationCreate(BaseModel):
     count: int = 1
 
 
+class AlertSettings(BaseModel):
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    from_address: str = ""
+    to_addresses: List[str] = []
+    enabled: bool = False
+    starttls: bool = True
+    alert_on_saturation: bool = True
+    alert_on_expiry: bool = True
+    expiry_warn_days: int = 30
+
+
+class AlertEvent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    kind: Literal["saturation", "expiry", "test"]
+    server_id: Optional[str] = None
+    server_name: Optional[str] = None
+    feature: Optional[str] = None
+    detail: str
+    delivered: bool = False
+    error: Optional[str] = None
+
+
 class AuditLog(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -145,7 +190,8 @@ def generate_checkouts(server: dict):
     if not features:
         return checkouts
     for feat in features:
-        in_use = random.randint(0, min(feat.get("total", 1), 4))
+        # Random utilization 0..total+1 (allowing saturation/over occasionally)
+        in_use = random.randint(0, feat.get("total", 1))
         for _ in range(in_use):
             ago = random.randint(2, 480)
             ct = datetime.now(timezone.utc) - timedelta(minutes=ago)
@@ -160,6 +206,149 @@ def generate_checkouts(server: dict):
                 pid=random.randint(1000, 65000),
             ).model_dump())
     return checkouts
+
+
+# ---------- Expiry parsing ----------
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+)}
+
+
+def parse_expiry(expires_str: str) -> Optional[date]:
+    """Parse FlexLM-style date like '31-dec-2026' or '2026-12-31'. None for 'permanent'."""
+    if not expires_str:
+        return None
+    s = expires_str.strip().lower()
+    if s in ("permanent", "0", "none"):
+        return None
+    # 31-dec-2026
+    m = re.match(r"^(\d{1,2})-([a-z]{3})-(\d{4})$", s)
+    if m:
+        d, mon, y = int(m.group(1)), _MONTHS.get(m.group(2)), int(m.group(3))
+        if mon:
+            try:
+                return date(y, mon, d)
+            except ValueError:
+                return None
+    # 2026-12-31
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def days_until(d: Optional[date]) -> Optional[int]:
+    if d is None:
+        return None
+    return (d - date.today()).days
+
+
+# ---------- SMTP / Alerts ----------
+async def get_alert_settings() -> dict:
+    doc = await db.settings.find_one({"_key": "alerts"}, {"_id": 0})
+    if not doc:
+        return AlertSettings().model_dump()
+    doc.pop("_key", None)
+    return doc
+
+
+def send_smtp_email(cfg: dict, subject: str, body: str) -> tuple[bool, Optional[str]]:
+    """Send via Office 365 / generic SMTP. Returns (ok, error)."""
+    if not cfg.get("enabled") or not cfg.get("smtp_host") or not cfg.get("to_addresses"):
+        return False, "SMTP not configured"
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = cfg.get("from_address") or cfg.get("smtp_username")
+        msg["To"] = ", ".join(cfg["to_addresses"])
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        host = cfg["smtp_host"]
+        port = int(cfg.get("smtp_port", 587))
+        with smtplib.SMTP(host, port, timeout=10) as s:
+            s.ehlo()
+            if cfg.get("starttls", True):
+                ctx = ssl.create_default_context()
+                s.starttls(context=ctx)
+                s.ehlo()
+            if cfg.get("smtp_username") and cfg.get("smtp_password"):
+                s.login(cfg["smtp_username"], cfg["smtp_password"])
+            s.sendmail(msg["From"], cfg["to_addresses"], msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def _alert_throttled(kind: str, server_id: Optional[str], feature: Optional[str]) -> bool:
+    """Return True if a similar alert was fired in last 6 hours."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    q = {"kind": kind, "server_id": server_id, "feature": feature, "timestamp": {"$gt": cutoff}}
+    return (await db.alert_events.count_documents(q)) > 0
+
+
+async def trigger_alert(kind: str, detail: str, server_id: Optional[str] = None,
+                        server_name: Optional[str] = None, feature: Optional[str] = None):
+    if await _alert_throttled(kind, server_id, feature):
+        return
+    cfg = await get_alert_settings()
+    enable_flag = {
+        "saturation": cfg.get("alert_on_saturation", True),
+        "expiry": cfg.get("alert_on_expiry", True),
+        "test": True,
+    }.get(kind, True)
+    delivered, err = False, None
+    if cfg.get("enabled") and enable_flag:
+        subject = f"[LICMAN] {kind.upper()} — {server_name or 'server'} · {feature or ''}".strip()
+        delivered, err = send_smtp_email(cfg, subject, detail)
+    ev = AlertEvent(
+        kind=kind, server_id=server_id, server_name=server_name,
+        feature=feature, detail=detail, delivered=delivered, error=err  # type: ignore
+    )
+    await db.alert_events.insert_one(ev.model_dump())
+    sev = "warning" if kind == "saturation" else ("error" if kind == "expiry" else "info")
+    await log_audit(f"ALERT_{kind.upper()}", detail, server_id, server_name, sev)
+
+
+async def evaluate_alerts():
+    """Scan all servers for saturation and expiry conditions."""
+    cfg = await get_alert_settings()
+    warn_days = int(cfg.get("expiry_warn_days", 30))
+    servers = await db.servers.find({"status": "up"}, {"_id": 0}).to_list(500)
+    for srv in servers:
+        in_use_by_feat = {}
+        for c in generate_checkouts(srv):
+            in_use_by_feat[c["feature"]] = in_use_by_feat.get(c["feature"], 0) + 1
+        for feat in srv.get("features", []):
+            total = feat.get("total", 0)
+            used = in_use_by_feat.get(feat["name"], 0)
+            if total > 0 and used >= total:
+                await trigger_alert(
+                    "saturation",
+                    f"Feature {feat['name']} on {srv['name']} is SATURATED ({used}/{total} in use).",
+                    srv["id"], srv["name"], feat["name"],
+                )
+            d = days_until(parse_expiry(feat.get("expires", "")))
+            if d is not None and d <= warn_days:
+                await trigger_alert(
+                    "expiry",
+                    f"Feature {feat['name']} on {srv['name']} expires in {d} day(s) ({feat.get('expires')}).",
+                    srv["id"], srv["name"], feat["name"],
+                )
+
+
+# ---------- SSH adapter (mocked) ----------
+async def ssh_execute(server: dict, command: str) -> dict:
+    """Mocked SSH executor — records what *would* be executed when adapter_mode='ssh'."""
+    mode = server.get("adapter_mode", "mock")
+    ssh = server.get("ssh", {}) or {}
+    if mode == "ssh" and ssh.get("enabled"):
+        host = ssh.get("host") or server.get("host")
+        msg = f"[SSH STUB] would execute on {ssh.get('username','?')}@{host}:{ssh.get('port',22)} -> {command}"
+        return {"mode": "ssh-stub", "command": command, "output": msg}
+    return {"mode": "mock", "command": command, "output": f"[MOCK] {command} executed"}
+
 
 
 def default_license_text(vendor: str, name: str, port: int, daemon: str):
@@ -359,12 +548,14 @@ async def reread(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
+    exec_log = await ssh_execute(doc, f"lmreread -c @{doc['port']}@{doc['host']}")
     await db.servers.update_one(
         {"id": server_id},
-        {"$set": {"status": "up", "last_action": f"lmreread @ {datetime.now(timezone.utc).isoformat()}"}}
+        {"$set": {"status": "up", "last_action": f"lmreread [{exec_log['mode']}] @ {datetime.now(timezone.utc).isoformat()}"}}
     )
-    await log_audit("LMREREAD", f"lmreread issued to {doc['name']}", server_id, doc["name"], "info")
-    return {"ok": True, "message": f"lmreread executed on {doc['name']}"}
+    await log_audit("LMREREAD", f"lmreread issued to {doc['name']} · {exec_log['output']}",
+                    server_id, doc["name"], "info")
+    return {"ok": True, "message": f"lmreread executed on {doc['name']}", "exec": exec_log}
 
 
 @api_router.post("/servers/{server_id}/restart")
@@ -372,13 +563,14 @@ async def restart(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
+    exec_log = await ssh_execute(doc, f"systemctl restart {doc['daemon']}")
     await db.servers.update_one(
         {"id": server_id},
-        {"$set": {"status": "up", "last_action": f"restart @ {datetime.now(timezone.utc).isoformat()}"}}
+        {"$set": {"status": "up", "last_action": f"restart [{exec_log['mode']}] @ {datetime.now(timezone.utc).isoformat()}"}}
     )
-    await log_audit("DAEMON_RESTART", f"Daemon restart issued on {doc['name']}",
+    await log_audit("DAEMON_RESTART", f"Daemon restart on {doc['name']} · {exec_log['output']}",
                     server_id, doc["name"], "warning")
-    return {"ok": True, "message": f"{doc['daemon']} restarted on {doc['name']}"}
+    return {"ok": True, "message": f"{doc['daemon']} restarted on {doc['name']}", "exec": exec_log}
 
 
 @api_router.post("/servers/{server_id}/toggle")
@@ -416,7 +608,152 @@ async def all_checkouts():
     await db.checkouts.delete_many({})
     if all_co:
         await db.checkouts.insert_many([{**c} for c in all_co])
+    # Side-effect: evaluate alert conditions on each fetch (best-effort)
+    try:
+        await evaluate_alerts()
+    except Exception as e:
+        logger.warning(f"alert evaluation failed: {e}")
     return all_co
+
+
+# ---------- SSH config ----------
+
+@api_router.put("/servers/{server_id}/ssh", response_model=LicenseServer)
+async def save_ssh_config(server_id: str, payload: SshConfig):
+    res = await db.servers.find_one_and_update(
+        {"id": server_id}, {"$set": {"ssh": payload.model_dump()}},
+        return_document=True, projection={"_id": 0}
+    )
+    if not res:
+        raise HTTPException(404, "Server not found")
+    await log_audit("SSH_CONFIG", f"SSH config updated for {res['name']} (host={payload.host})",
+                    server_id, res["name"], "info")
+    return res
+
+
+class AdapterPayload(BaseModel):
+    adapter_mode: Literal["mock", "ssh"]
+
+
+@api_router.put("/servers/{server_id}/adapter")
+async def set_adapter(server_id: str, payload: AdapterPayload):
+    res = await db.servers.find_one_and_update(
+        {"id": server_id}, {"$set": {"adapter_mode": payload.adapter_mode}},
+        return_document=True, projection={"_id": 0}
+    )
+    if not res:
+        raise HTTPException(404, "Server not found")
+    await log_audit("ADAPTER_MODE", f"{res['name']} adapter -> {payload.adapter_mode}",
+                    server_id, res["name"], "warning")
+    return {"ok": True, "adapter_mode": payload.adapter_mode}
+
+
+@api_router.post("/servers/{server_id}/ssh/test")
+async def test_ssh(server_id: str):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    ssh = doc.get("ssh", {}) or {}
+    # Mock: succeed only if host+user are filled
+    ok = bool(ssh.get("host") and ssh.get("username"))
+    msg = (f"[STUB] would connect to {ssh.get('username')}@{ssh.get('host')}:{ssh.get('port', 22)}"
+           if ok else "Missing host or username")
+    await log_audit("SSH_TEST", msg, server_id, doc["name"], "success" if ok else "error")
+    return {"ok": ok, "message": msg, "mocked": True}
+
+
+# ---------- Expiry ----------
+
+@api_router.get("/expiry")
+async def expiry_calendar(warn_days: int = 90):
+    servers = await db.servers.find({}, {"_id": 0}).to_list(500)
+    rows = []
+    for s in servers:
+        for f in s.get("features", []):
+            d = parse_expiry(f.get("expires", ""))
+            days = days_until(d)
+            rows.append({
+                "server_id": s["id"],
+                "server_name": s["name"],
+                "vendor": s["vendor"],
+                "feature": f["name"],
+                "version": f.get("version"),
+                "total": f.get("total"),
+                "expires": f.get("expires"),
+                "expires_iso": d.isoformat() if d else None,
+                "days_remaining": days,
+                "status": (
+                    "permanent" if days is None
+                    else "expired" if days < 0
+                    else "critical" if days <= 30
+                    else "warning" if days <= warn_days
+                    else "ok"
+                ),
+            })
+    # Sort: expired first, then nearest expiry, permanent at end
+    def sk(r):
+        if r["days_remaining"] is None:
+            return (2, 0)
+        if r["days_remaining"] < 0:
+            return (0, r["days_remaining"])
+        return (1, r["days_remaining"])
+    rows.sort(key=sk)
+    return rows
+
+
+# ---------- Settings / Alerts ----------
+
+@api_router.get("/settings")
+async def get_settings():
+    return await get_alert_settings()
+
+
+@api_router.put("/settings")
+async def put_settings(payload: AlertSettings):
+    data = payload.model_dump()
+    data["_key"] = "alerts"
+    await db.settings.update_one({"_key": "alerts"}, {"$set": data}, upsert=True)
+    await log_audit("SETTINGS_SAVE", f"Alert settings updated (enabled={payload.enabled}, recipients={len(payload.to_addresses)})",
+                    None, None, "info")
+    out = data.copy()
+    out.pop("_key", None)
+    out.pop("smtp_password", None)
+    out["smtp_password_set"] = bool(payload.smtp_password)
+    return out
+
+
+@api_router.post("/settings/test-email")
+async def test_email():
+    cfg = await get_alert_settings()
+    if not cfg.get("smtp_host"):
+        raise HTTPException(400, "SMTP host not configured")
+    if not cfg.get("to_addresses"):
+        raise HTTPException(400, "No recipient addresses configured")
+    # Force enabled=True for the test send
+    cfg2 = {**cfg, "enabled": True}
+    ok, err = send_smtp_email(
+        cfg2, "[LICMAN] Test email", "This is a test alert from LICMAN. If you receive this, SMTP works."
+    )
+    ev = AlertEvent(
+        kind="test", detail=f"Test email -> {', '.join(cfg['to_addresses'])}",
+        delivered=ok, error=err  # type: ignore
+    )
+    await db.alert_events.insert_one(ev.model_dump())
+    await log_audit("ALERT_TEST", f"Test email: delivered={ok} err={err}", None, None,
+                    "success" if ok else "error")
+    return {"ok": ok, "error": err}
+
+
+@api_router.get("/alerts")
+async def list_alerts(limit: int = 50):
+    docs = await db.alert_events.find({}, {"_id": 0}).sort("timestamp", -1).to_list(limit)
+    return docs
+
+
+@api_router.post("/alerts/evaluate")
+async def force_evaluate_alerts():
+    await evaluate_alerts()
+    return {"ok": True}
 
 
 @api_router.get("/reservations", response_model=List[Reservation])
@@ -487,6 +824,7 @@ async def seed_reset():
     await db.checkouts.delete_many({})
     await db.reservations.delete_many({})
     await db.audit.delete_many({})
+    await db.alert_events.delete_many({})
     await seed_if_empty()
     return {"ok": True}
 
