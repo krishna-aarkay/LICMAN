@@ -1,0 +1,111 @@
+{
+  "theme": "Dark",
+  "archetype": "Archetype 4 (Swiss & High-Contrast) + Retro-Futurism Surface",
+  "mood": "Authoritative, Dense, Technical, Command-Center, Terminal-Adjacent",
+  "typography": {
+    "fonts": {
+      "heading": "JetBrains Mono",
+      "body": "IBM Plex Sans",
+      "code": "JetBrains Mono"
+    },
+    "hierarchy": {
+      "h1": "text-3xl font-bold tracking-tight",
+      "h2": "text-2xl font-semibold tracking-tight",
+      "h3": "text-xl font-medium",
+      "h4": "text-sm font-semibold uppercase tracking-[0.2em]",
+      "body": "text-sm leading-relaxed",
+      "code": "text-xs font-mono tracking-tight",
+      "label": "text-xs font-medium uppercase tracking-wider"
+    },
+    "instructions": "Use JetBrains Mono for all numeric data, tables, logs, and primary headings to maintain the CAD/terminal aesthetic. Use IBM Plex Sans for longer reading text or secondary navigation."
+  },
+  "colors": {
+    "background": {
+      "default": "#050505",
+      "surface": "#111111",
+      "surface_hover": "#1A1A1A"
+    },
+    "border": {
+      "default": "#222222",
+      "focus": "#333333"
+    },
+    "text": {
+      "primary": "#F3F4F6",
+      "secondary": "#9CA3AF",
+      "muted": "#6B7280"
+    },
+    "semantic": {
+      "success": {
+        "text": "#10B981",
+        "bg": "rgba(16, 185, 129, 0.1)",
+        "border": "rgba(16, 185, 129, 0.3)"
+      },
+      "warning": {
+        "text": "#F59E0B",
+        "bg": "rgba(245, 158, 11, 0.1)",
+        "border": "rgba(245, 158, 11, 0.3)"
+      },
+      "error": {
+        "text": "#EF4444",
+        "bg": "rgba(239, 68, 68, 0.1)",
+        "border": "rgba(239, 68, 68, 0.3)"
+      },
+      "info": {
+        "text": "#3B82F6",
+        "bg": "rgba(59, 130, 246, 0.1)",
+        "border": "rgba(59, 130, 246, 0.3)"
+      }
+    }
+  },
+  "visual_enhancers": {
+    "surface_strategy": "Grid Borders (The Technical Look) + Retro-Futurism",
+    "borders": "1px solid #222222 on all cards. No rounded corners, or max rounded-sm (2px) for a sharp, rigid, technical feel.",
+    "shadows": "Minimal to none. Rely on 1px borders for separation. Hover states can use a subtle drop-shadow with the primary text color (e.g. shadow-[0_0_8px_rgba(255,255,255,0.1)]).",
+    "glassmorphism": "Avoid. Use solid dark backgrounds to maintain contrast and legibility."
+  },
+  "grids_and_layouts": {
+    "strategy": "The Control Room Grid",
+    "spacing": "Dense. Use p-4 for cards, gap-4 for grids.",
+    "patterns": {
+      "dashboard_layout": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4",
+      "summary_cards": "col-span-1",
+      "main_data": "col-span-3 lg:col-span-3"
+    }
+  },
+  "components": {
+    "cards": "Flat background (#111111), 1px subtle border (#222222), no shadow. Content aligned left.",
+    "tables": "Dense rows, monospace text for IDs/Hostnames/Users, sticky headers, subtle hover state (bg-[#1A1A1A]).",
+    "buttons": "Square or rounded-sm. Primary CTA uses a stark white background with black text (Swiss Brutalist inversion). Secondary buttons use outline with subtle grey hover.",
+    "editors": "Options file / License file editors MUST use a monospace font, dark background (#000000), and syntax highlighting (green/amber/red for keywords).",
+    "status_indicators": "Small pulsing dots or solid terminal blocks next to text (e.g. [UP] in green).",
+    "icons": "Use Phosphor Icons (dense, readable) or Lucide. Size them small (16px/20px)."
+  },
+  "motion": {
+    "hover": "Instant or very fast (100ms) transitions for a snappy, zero-latency feel.",
+    "focus": "High contrast 2px solid ring, usually white or blue.",
+    "loaders": "ASCII spinners or fast terminal-style cursor blinks."
+  },
+  "media_and_images": {
+    "image_urls": [
+      {
+        "category": "header_background",
+        "url": "https://static.prod-images.emergentagent.com/jobs/7b2f5714-bf18-42c4-8bae-496eec3e37d3/images/2a292681de8ef751663942d857b9c4508d8b3cf3cd05a77b4d90311b3ad5a5b5.png",
+        "description": "Abstract dark technical grid pattern to be used as a subtle repeating or banner background behind the top nav or header, at low opacity (10-20%) so it doesn't distract from data."
+      }
+    ]
+  },
+  "accessibility": {
+    "contrast": "Ensure all text, especially grey/muted text, passes APCA/WCAG AA against the #050505 and #111111 backgrounds.",
+    "focus_management": "Ensure keyboard navigability with highly visible focus rings.",
+    "testing": "All interactive elements MUST have data-testid attributes."
+  },
+  "instructions_to_main_agent": [
+    "You have .js files not .tsx file, so write components in JavaScript (.jsx/.js) syntax, NOT TypeScript.",
+    "Avoid using Shadcn's default Card styling if it's too soft/rounded. Override rounded corners to 'rounded-none' or 'rounded-sm' and remove heavy shadows.",
+    "For the code editor, implement a simple textarea or a syntax highlighter like PrismJS/react-simple-code-editor with JetBrains Mono.",
+    "Build a 4-column Control Room layout: top row for status cards, main area for live checkout table, side panel for daemon control and quick logs.",
+    "Use Phosphor icons (e.g., '@phosphor-icons/react') for sharp, technical iconography. If unavailable, use Lucide.",
+    "NEVER use Inter or generic sans for the main UI. Default to IBM Plex Sans, and heavily rely on JetBrains Mono for data points.",
+    "NEVER use gradient backgrounds for buttons or cards. Keep it matte, flat, and terminal-adjacent."
+  ]
+}
