@@ -50,37 +50,42 @@ Follow-ups:
   - `README.md` — end-to-end install guide
 
 ## Testing
-- Backend: **40/40 pytests** passing (13 + 16 + 11 across iterations)
-- Frontend: all iteration 3 review scope verified by testing agent
+- Backend: **66/66 pytests** passing (iter4 auth 27 + iter6 hardening 18 + iter7 features 21)
+- Frontend: all critical flows verified by testing agent across iterations 5–7
+
+## Iteration 7 — "Add all the best" final feature batch — 2026-02
+- **Bulk operations**: `POST /api/servers/sync-all` and `POST /api/servers/reread-all` for one-click maintenance across the fleet (admin-only). Dashboard exposes new `SYNC ALL` and `REREAD ALL` buttons gated to admin.
+- **Slack / Teams / generic webhooks**: `AlertSettings` extended with `webhook_url`, `webhook_kind`, `webhook_enabled`. Webhook fired in addition to SMTP from `trigger_alert`. New `POST /api/settings/test-webhook` for one-click delivery test. Settings page got a dedicated WEBHOOK panel.
+- **Options file validator**: `POST /api/servers/{id}/options/validate` returns line-numbered errors/warnings against the FlexLM directive grammar (RESERVE/INCLUDE/EXCLUDE/GROUP/MAX/TIMEOUT/...). ServerDetail → Options tab gets a VALIDATE button + inline results panel.
+- **CSV exports**: `GET /api/expiry/export` and `GET /api/audit/export` stream CSV with attachment headers. Expiry page + Settings page each carry a download button.
+- **Settings backfill**: `get_alert_settings` merges defaults so legacy DB records expose the new webhook fields to the UI without a manual migration.
 
 ## Open Concerns / Tech Debt
-- `server.py` is ~915 lines — split into modules (`models.py`, `services/ssh.py`, `services/alerts.py`, `routes/*`)
-- `_ssh_real_exec` uses `AutoAddPolicy` — add strict known-hosts mode for prod
-- SMTP/SSH credentials stored in plaintext — add Fernet encryption keyed by env var
-- `ssh/test` endpoint uses stub validation; could invoke real `_ssh_real_exec`
-- No vendor name normalization (`Cadence` vs `cadence` create two groups)
-- `seed/reset` + `DEMO_MODE=0` leaves DB empty silently — document
+- `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
+- `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.
+- CSV exports build in memory with `StringIO`. Switch to `StreamingResponse` if audit corpus grows large.
+- `audit_export` currently inherits the same auth as `/api/audit` (any logged-in user). Tighten to `require_admin` if compliance demands it.
+- `_ssh_real_exec` uses `AutoAddPolicy` — add strict known-hosts mode for prod.
+- No vendor name normalization (`Cadence` vs `cadence` create two groups).
 
 ## Prioritized Backlog
 ### P1
-- `lmstat -a -c <port>@<host>` parser to populate real checkouts (replace random generator) once SSH is live
-- Encrypt secrets at rest
-- Wire `ssh/test` to real paramiko handshake
+- Production SSH validation on user's air-gapped RHEL 10 box (real lmstat output regex tuning if needed)
+- Split `server.py` into route modules
 
 ### P2
-- Slack/Teams webhook alongside SMTP
-- CSV export of checkouts / audit / expiry
+- Vendor-specific daemon startup scripts when lmdown/lmreread divergence appears
 - Per-feature usage sparkline + 24×7 peak-hours heatmap
-- Bulk lmreread across all servers
 - LDAP / SSO for multi-user
+- Diff view when saving license/options
 
 ### P3
-- Diff view when saving license/options
 - Public read-only status board for engineers
 - License purchase ROI dashboard
+- Bulk reservation propagation across vendor-grouped servers
 
 ## Next Tasks
-1. User runs `bash deploy/install-rhel9.sh` on 10.10.11.11
-2. User runs `bash deploy/setup-license-host.sh 10.10.11.11` on each license host
-3. User pastes the printed private key into LICMAN UI → server → Connection tab → SSH mode → SAVE
-4. We then implement a real `lmstat` output parser to replace the random checkout generator
+1. User runs `bash deploy/install-rhel9.sh` on the production RHEL host
+2. User runs `bash deploy/setup-license-host.sh <licman-host>` on each license server
+3. User configures SSH credentials in LICMAN UI → Connection tab → SSH mode → SAVE
+4. (Optional) Configure Slack/Teams webhook in Settings → WEBHOOK panel for chat alerts
