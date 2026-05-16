@@ -173,7 +173,7 @@ export default function Settings() {
                   />
                 </Field>
                 <Field label="STARTTLS">
-                  <div className="flex border border-[#222]">
+                  <div className="flex border border-[#222]" data-testid="starttls-toggle">
                     {[true, false].map((v) => (
                       <button
                         key={String(v)}
@@ -212,18 +212,21 @@ export default function Settings() {
                   value={cfg.enabled}
                   onChange={(v) => upd({ enabled: v })}
                   testid="alerts-enabled"
+                  wrapperTestid="alert-master-toggle"
                 />
                 <Toggle
                   label="Saturation Alerts"
                   value={cfg.alert_on_saturation}
                   onChange={(v) => upd({ alert_on_saturation: v })}
                   testid="alerts-saturation"
+                  wrapperTestid="alert-saturation-toggle"
                 />
                 <Toggle
                   label="Expiry Alerts"
                   value={cfg.alert_on_expiry}
                   onChange={(v) => upd({ alert_on_expiry: v })}
                   testid="alerts-expiry"
+                  wrapperTestid="alert-expiry-toggle"
                 />
                 <Field label="Expiry warn threshold (days)" full>
                   <input
@@ -330,8 +333,8 @@ const Field = ({ label, children, full }) => (
   </div>
 );
 
-const Toggle = ({ label, value, onChange, testid }) => (
-  <div>
+const Toggle = ({ label, value, onChange, testid, wrapperTestid }) => (
+  <div data-testid={wrapperTestid}>
     <div className="text-[10px] uppercase tracking-[0.2em] text-[#6b7280] mb-1 font-mono">
       {label}
     </div>

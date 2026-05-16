@@ -5,8 +5,9 @@
 
 ## User Choices
 - Auth: **None** (single-user internal tool)
-- Theme: User said "you decide" → Dark Swiss/Terminal aesthetic, JetBrains Mono + IBM Plex Sans
-- Mode: Fully mocked demo (simulated `lmstat`/`lmreread` — safe iteration)
+- Theme: Dark Swiss/Terminal aesthetic, JetBrains Mono + IBM Plex Sans
+- License-server adapter: **MOCKED + SSH adapter layer scaffolded** (paramiko swap-in later)
+- Alert channel: **Office 365 SMTP** (configured via web UI)
 
 ## Personas
 - **CAD Engineer**: power user; manages 3+ vendors of FlexLM-style servers; lives in terminal; values density & speed over decoration.
@@ -15,48 +16,67 @@
 1. Multi-vendor license server registry (Cadence, Synopsys, Siemens-Mentor)
 2. Install / edit license files (`.lic`) per server, parse FEATURE lines
 3. Edit options files with directives: RESERVE / INCLUDE / EXCLUDE / GROUP / MAX / TIMEOUT
-4. Live monitoring of feature checkouts (user, host, feature, version, PID, since)
+4. Live monitoring of feature checkouts
 5. Reserve / Unreserve features for users/hosts/groups
 6. Daemon control: lmreread / restart / stop
 7. Audit log of every action
-8. Aggregate stats: servers up, features total, active checkouts, reservations
+8. **License expiry tracking** + alerts when nearing expiration
+9. **Saturation alerts** when a feature hits 100% checked-out
+10. **SSH connection adapter** for remote license-host execution (mock-only today)
+11. **Office 365 / SMTP alerts** with master + per-trigger toggles
+12. **Persistent UI preferences** via localStorage
 
-## Implemented (2026-02)
-### Backend (`/app/backend/server.py`)
-- MongoDB collections: `servers`, `checkouts`, `reservations`, `audit`
-- 18 `/api/*` endpoints (CRUD + actions + stats + seed reset)
-- Auto-seed 3 servers on startup: lic-cadence-prod-01 (Innovus, Genus, Virtuoso, Spectre, Tempus), lic-synopsys-prod-01 (VCS, DC, PrimeTime, ICC2, Verdi), lic-mentor-prod-01 (Calibre DRC/LVS, Questa, Tessent)
-- License file FEATURE-line regex parser updates server.features on save
-- Simulated checkouts generated per call using realistic user/host pools
+## Implemented
 
-### Frontend (React + Tailwind + shadcn)
-- Dark "Control Room" UI — JetBrains Mono / IBM Plex Sans, no rounded corners, semantic colors (emerald=up, amber=warn, red=down)
-- `/` Dashboard: live header stats + UTC clock + auto-refresh, 3 vendor server cards with per-card REREAD/RESTART/STOP, live checkouts table (vendor filter + search), audit timeline
-- `/servers/:id`: feature-usage bars, 5 tabs (Checkouts / License File / Options File / Reservations / Audit), monospace code editor with line numbers + syntax highlighting, reservation dialog
-- ADD SERVER and RESET demo data buttons
+### 2026-02 — MVP (iteration 1)
+- 18 `/api` endpoints (server CRUD, license/options editing with FEATURE parsing, lmreread, restart, toggle, checkouts, reservations, audit, stats, seed/reset)
+- 3-server auto-seed (Innovus/VCS/Calibre…)
+- Dashboard with live stats, vendor cards, checkouts table, audit timeline
+- ServerDetail with 5 tabs (Checkouts, License File, Options, Reservations, Audit) + monospace code editor with syntax highlighting
+
+### 2026-02 — iteration 2 (alerts + SSH + expiry + prefs)
+- **New Models**: `SshConfig`, `AlertSettings`, `AlertEvent`
+- **New endpoints**: `/api/settings` GET/PUT, `/api/settings/test-email`, `/api/alerts`, `/api/alerts/evaluate`, `/api/expiry`, `/api/servers/{id}/ssh`, `/api/servers/{id}/adapter`, `/api/servers/{id}/ssh/test`
+- **Alert engine**: Saturation + expiry detection wired as side-effect of `GET /api/checkouts`; 6-hour throttle per (kind, server, feature); SMTP delivery via stdlib `smtplib` with STARTTLS (Office 365 ready)
+- **Expiry parser**: `31-dec-2026` / `2026-12-31` / `permanent` formats; computes `days_remaining` and severity (expired/critical/warning/ok/permanent)
+- **SSH adapter (mocked)**: `ssh_execute` records "would-have-executed" commands; switching `adapter_mode='ssh'` is the only line to swap with real paramiko later
+- **Frontend pages added**: `/expiry` (color-coded calendar), `/settings` (SMTP form + O365 preset + alert toggles + recent alerts column)
+- **Frontend components added**: `ExpiryBadge`, `SshConfigPanel`
+- **ServerDetail**: new "Connection" tab with full SSH config form + adapter mode toggle + test button
+- **Feature bars**: now show ExpiryBadge with color-coded days remaining
+- **Header**: 3 nav links (Control Room / Expiry / Settings)
+- **localStorage `licman_prefs_v1`**: persists `autoRefresh`, `vendorFilter`, `searchQuery`, `lastServerId`
 
 ## Testing
-- Backend: **13/13 pytest cases PASSED** (`/app/backend/tests/backend_test.py`)
-- Frontend: core flows render & API-integrated; testid coverage extended in iteration 1
+- Backend: **29/29 pytests passing** (13 from iteration 1 + 16 new for iteration 2)
+- All new endpoints verified end-to-end; alert engine confirmed triggering automatically
+
+## Open Concerns / Tech Debt
+- `server.py` is ~860 lines — consider splitting into modules
+- `send_smtp_email` runs synchronously in async endpoint — wrap with `asyncio.to_thread` under load
+- SMTP password stored in plaintext — encrypt-at-rest for prod
+- SSH credentials stored in plaintext — same caveat
+- `adapter_mode='ssh'` doesn't enforce `ssh.enabled=True`
 
 ## Prioritized Backlog
-### P1 (next)
-- Real `lmstat` / `lmreread` integration via SSH or local shell command runner (currently mocked)
-- Per-feature checkout *deltas* over time (sparkline chart)
-- CSV export of checkouts & audit log
+### P1
+- Real paramiko SSH execution (swap-in for `ssh_execute` mock)
+- Live `lmstat -a` parsing into checkouts (replace random generator)
+- Encrypt SMTP & SSH credentials at rest
 
 ### P2
-- Multi-user auth (JWT or Google) — currently single-user
-- Email/Slack alerts when a feature is fully checked out
-- License expiry calendar / countdown widget
-- Diff view when saving license/options files
+- Slack webhook channel alongside SMTP
+- CSV export of checkouts / audit / expiry
+- Per-feature usage sparkline + peak-hour heatmap (helps justify budget)
+- Bulk lmreread across all servers
 
 ### P3
+- Multi-user JWT auth (deferred per user choice)
+- Public read-only status board for end-engineers
+- Diff view when saving license/options files
 - Multi-server bulk actions
-- License usage analytics over weeks/months
-- Public read-only status dashboard for end-engineers
 
 ## Next Tasks
-1. Wire real `lmstat`/`lmutil` integration when user grants SSH access to license hosts
-2. Add expiry warnings to license file editor
-3. Persist auto-refresh & filter preferences in localStorage
+1. When user grants SSH access, swap `ssh_execute` mock with paramiko 1-liner
+2. Refactor `server.py` into modules (`models/`, `routes/`, `services/`)
+3. Add encryption for stored secrets (Fernet keyed by env var)

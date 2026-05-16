@@ -107,7 +107,7 @@ export default function Expiry() {
           </div>
 
           <div className="overflow-x-auto max-h-[68vh] overflow-y-auto">
-            <table className="w-full font-mono text-xs">
+            <table className="w-full font-mono text-xs" data-testid="expiry-table">
               <thead className="bg-[#0a0a0a] sticky top-0 z-10">
                 <tr className="text-left text-[10px] uppercase tracking-wider text-[#6b7280]">
                   <th className="px-4 py-2">Vendor</th>
@@ -171,7 +171,7 @@ export default function Expiry() {
 const Tile = ({ label, n, color }) => (
   <div
     className="border border-[#222] bg-[#111] px-3 py-1.5 flex items-center gap-2"
-    data-testid={`expiry-tile-${label.toLowerCase()}`}
+    data-testid={`expiry-summary-${label.toLowerCase()}`}
   >
     <span className="uppercase tracking-wider text-[#6b7280]">{label}</span>
     <span className="font-bold tabular-nums" style={{ color }}>
