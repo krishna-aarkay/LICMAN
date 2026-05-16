@@ -1,82 +1,86 @@
 # LICMAN — VLSI License Console
 
 ## Original Problem Statement
-> I am a cad engineer in to VLSI. Most of the times I work with cadence siemens-mentor and synpsys licenses servers hosting on local network. My daily routine is to install the licenses files apply options files and save changes, monitoring licenses checkouts reserve and unreserves changes and saves. it is too bored and repeated for me. Help me to build a web pages to do all above things from the web itself.
+> I am a cad engineer in to VLSI. Most of the times I work with cadence siemens-mentor and synpsys licenses servers hosting on local network… Help me to build a web pages to do all above things from the web itself.
+
+Follow-ups:
+> Add license expiry countdown + Office 365 email alerts. Persist filter & auto-refresh preferences. Wire real lmstat / lmreread integration over SSH.
+> Host on private network (10.10.11.0/24) — web app on 10.10.11.11, cadence at .111, siemens at .112, synopsys at .113. Allow adding more vendors (XILINX, defacto, others). RHEL 9 host.
 
 ## User Choices
 - Auth: **None** (single-user internal tool)
 - Theme: Dark Swiss/Terminal aesthetic, JetBrains Mono + IBM Plex Sans
-- License-server adapter: **MOCKED + SSH adapter layer scaffolded** (paramiko swap-in later)
-- Alert channel: **Office 365 SMTP** (configured via web UI)
-
-## Personas
-- **CAD Engineer**: power user; manages 3+ vendors of FlexLM-style servers; lives in terminal; values density & speed over decoration.
-
-## Core Requirements (Static)
-1. Multi-vendor license server registry (Cadence, Synopsys, Siemens-Mentor)
-2. Install / edit license files (`.lic`) per server, parse FEATURE lines
-3. Edit options files with directives: RESERVE / INCLUDE / EXCLUDE / GROUP / MAX / TIMEOUT
-4. Live monitoring of feature checkouts
-5. Reserve / Unreserve features for users/hosts/groups
-6. Daemon control: lmreread / restart / stop
-7. Audit log of every action
-8. **License expiry tracking** + alerts when nearing expiration
-9. **Saturation alerts** when a feature hits 100% checked-out
-10. **SSH connection adapter** for remote license-host execution (mock-only today)
-11. **Office 365 / SMTP alerts** with master + per-trigger toggles
-12. **Persistent UI preferences** via localStorage
+- Adapter: SSH adapter scaffolded with **paramiko-ready** code (mock by default)
+- Alerts: Office 365 SMTP, configured from the web UI
+- Vendor field: **free-form text + curated palette** (Cadence/Synopsys/Siemens/Xilinx/Defacto/Ansys/Altair/Keysight/Intel/ARM presets + auto-color for any custom string)
+- Deployment: **Docker Compose** plug-and-play for RHEL 9
+- TLS: Both HTTP and self-signed HTTPS supported
+- License-host execution: dedicated `licadmin` service account with restricted sudoers
 
 ## Implemented
 
-### 2026-02 — MVP (iteration 1)
-- 18 `/api` endpoints (server CRUD, license/options editing with FEATURE parsing, lmreread, restart, toggle, checkouts, reservations, audit, stats, seed/reset)
-- 3-server auto-seed (Innovus/VCS/Calibre…)
-- Dashboard with live stats, vendor cards, checkouts table, audit timeline
-- ServerDetail with 5 tabs (Checkouts, License File, Options, Reservations, Audit) + monospace code editor with syntax highlighting
+### MVP (iteration 1) — 2026-02
+- 18 `/api` endpoints (server CRUD, license/options editing, lmreread, restart, toggle, checkouts, reservations, audit, stats, seed/reset)
+- Dashboard, ServerDetail (5 tabs), monospace code editor with FlexLM syntax highlighting
 
-### 2026-02 — iteration 2 (alerts + SSH + expiry + prefs)
-- **New Models**: `SshConfig`, `AlertSettings`, `AlertEvent`
-- **New endpoints**: `/api/settings` GET/PUT, `/api/settings/test-email`, `/api/alerts`, `/api/alerts/evaluate`, `/api/expiry`, `/api/servers/{id}/ssh`, `/api/servers/{id}/adapter`, `/api/servers/{id}/ssh/test`
-- **Alert engine**: Saturation + expiry detection wired as side-effect of `GET /api/checkouts`; 6-hour throttle per (kind, server, feature); SMTP delivery via stdlib `smtplib` with STARTTLS (Office 365 ready)
-- **Expiry parser**: `31-dec-2026` / `2026-12-31` / `permanent` formats; computes `days_remaining` and severity (expired/critical/warning/ok/permanent)
-- **SSH adapter (mocked)**: `ssh_execute` records "would-have-executed" commands; switching `adapter_mode='ssh'` is the only line to swap with real paramiko later
-- **Frontend pages added**: `/expiry` (color-coded calendar), `/settings` (SMTP form + O365 preset + alert toggles + recent alerts column)
-- **Frontend components added**: `ExpiryBadge`, `SshConfigPanel`
-- **ServerDetail**: new "Connection" tab with full SSH config form + adapter mode toggle + test button
-- **Feature bars**: now show ExpiryBadge with color-coded days remaining
-- **Header**: 3 nav links (Control Room / Expiry / Settings)
-- **localStorage `licman_prefs_v1`**: persists `autoRefresh`, `vendorFilter`, `searchQuery`, `lastServerId`
+### Iteration 2 — Alerts / Expiry / SSH / Persistence
+- `SshConfig`, `AlertSettings`, `AlertEvent` models
+- `/api/settings`, `/api/settings/test-email`, `/api/alerts`, `/api/alerts/evaluate`, `/api/expiry`, `/api/servers/{id}/ssh`, `/api/servers/{id}/adapter`, `/api/servers/{id}/ssh/test`
+- Alert engine wired as side-effect of `/api/checkouts` with 6-hour throttle
+- SMTP send via stdlib `smtplib` (Office 365 preset, STARTTLS)
+- Expiry calendar page + per-feature color-coded badges
+- SSH adapter scaffold (mocked) + Connection tab
+- `localStorage` persistence (`licman_prefs_v1`)
+
+### Iteration 3 — Private network + vendor freedom + RHEL 9 deploy
+- **Vendor field opened to free-form string** (was `Literal`). Backend accepts any value (xilinx, defacto, ansys, altium, …)
+- **`vendorMeta()` helper** on frontend: curated colors for 12 known vendors (Cadence, Synopsys, Siemens/Mentor, Xilinx/AMD, Defacto, Ansys, Altair, Keysight, Intel, ARM…) + deterministic hash-based auto-color for anything else
+- **AddServerDialog** got a **PRESET / CUSTOM** toggle — preset gives one-click vendor + default port/daemon, custom is a free-text input
+- **Real paramiko SSH execution** added — when `adapter_mode='ssh'` AND `ssh.enabled=True`, `ssh_execute()` actually connects (RSA/Ed25519/ECDSA keys, password fallback). Wrapped in `asyncio.to_thread` for non-blocking. Errors returned gracefully as `mode='ssh-error'`
+- **Seed updated** to use 10.10.11.111/.112/.113 with vendors cadence/siemens/synopsys
+- **`DEMO_MODE=0`** env var disables auto-seeding for production installs
+- **CheckoutTable + Expiry filter chips dynamic** — derived from actual data, no longer hardcoded
+- **RHEL 9 deployment bundle** at `/app/deploy/`:
+  - `install-rhel9.sh` — one-shot: installs Docker CE + Compose, opens firewall 80/443, sets SELinux booleans, generates self-signed TLS cert, builds & starts 4 containers, installs `licman.service` systemd unit
+  - `docker-compose.yml` — mongo + backend + frontend + nginx
+  - `Dockerfile.backend` (Python 3.11 + paramiko), `Dockerfile.frontend` (Node 20 build → nginx static)
+  - `nginx.conf` — both HTTP and HTTPS reverse proxy (`/api` → backend, `/` → frontend)
+  - `setup-license-host.sh` — run on each license host (10.10.11.111/.112/.113…); creates `licadmin` user, generates ed25519 keypair, drops in restricted sudoers (`/etc/sudoers.d/licadmin`) that only permits lmstat/lmreread/lmdown and systemctl restart for cdslmd/snpslmd/mgcld/xilinxd/defacto
+  - `licman.service` — systemd unit so the stack starts on boot
+  - `README.md` — end-to-end install guide
 
 ## Testing
-- Backend: **29/29 pytests passing** (13 from iteration 1 + 16 new for iteration 2)
-- All new endpoints verified end-to-end; alert engine confirmed triggering automatically
+- Backend: **40/40 pytests** passing (13 + 16 + 11 across iterations)
+- Frontend: all iteration 3 review scope verified by testing agent
 
 ## Open Concerns / Tech Debt
-- `server.py` is ~860 lines — consider splitting into modules
-- `send_smtp_email` runs synchronously in async endpoint — wrap with `asyncio.to_thread` under load
-- SMTP password stored in plaintext — encrypt-at-rest for prod
-- SSH credentials stored in plaintext — same caveat
-- `adapter_mode='ssh'` doesn't enforce `ssh.enabled=True`
+- `server.py` is ~915 lines — split into modules (`models.py`, `services/ssh.py`, `services/alerts.py`, `routes/*`)
+- `_ssh_real_exec` uses `AutoAddPolicy` — add strict known-hosts mode for prod
+- SMTP/SSH credentials stored in plaintext — add Fernet encryption keyed by env var
+- `ssh/test` endpoint uses stub validation; could invoke real `_ssh_real_exec`
+- No vendor name normalization (`Cadence` vs `cadence` create two groups)
+- `seed/reset` + `DEMO_MODE=0` leaves DB empty silently — document
 
 ## Prioritized Backlog
 ### P1
-- Real paramiko SSH execution (swap-in for `ssh_execute` mock)
-- Live `lmstat -a` parsing into checkouts (replace random generator)
-- Encrypt SMTP & SSH credentials at rest
+- `lmstat -a -c <port>@<host>` parser to populate real checkouts (replace random generator) once SSH is live
+- Encrypt secrets at rest
+- Wire `ssh/test` to real paramiko handshake
 
 ### P2
-- Slack webhook channel alongside SMTP
+- Slack/Teams webhook alongside SMTP
 - CSV export of checkouts / audit / expiry
-- Per-feature usage sparkline + peak-hour heatmap (helps justify budget)
+- Per-feature usage sparkline + 24×7 peak-hours heatmap
 - Bulk lmreread across all servers
+- LDAP / SSO for multi-user
 
 ### P3
-- Multi-user JWT auth (deferred per user choice)
-- Public read-only status board for end-engineers
-- Diff view when saving license/options files
-- Multi-server bulk actions
+- Diff view when saving license/options
+- Public read-only status board for engineers
+- License purchase ROI dashboard
 
 ## Next Tasks
-1. When user grants SSH access, swap `ssh_execute` mock with paramiko 1-liner
-2. Refactor `server.py` into modules (`models/`, `routes/`, `services/`)
-3. Add encryption for stored secrets (Fernet keyed by env var)
+1. User runs `bash deploy/install-rhel9.sh` on 10.10.11.11
+2. User runs `bash deploy/setup-license-host.sh 10.10.11.11` on each license host
+3. User pastes the printed private key into LICMAN UI → server → Connection tab → SSH mode → SAVE
+4. We then implement a real `lmstat` output parser to replace the random checkout generator
