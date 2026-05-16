@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { ArrowLeft, FileText, Settings, ListChecks, Save, Plus, Trash2, RefreshCw, Power, Activity, Plug } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { api, VENDOR_META, fmtAgo } from "@/lib/api";
+import { api, vendorMeta, fmtAgo } from "@/lib/api";
 import { prefs } from "@/lib/prefs";
 import Header from "@/components/Header";
 import CodeEditor from "@/components/CodeEditor";
@@ -84,7 +84,7 @@ export default function ServerDetail() {
     );
   }
 
-  const meta = VENDOR_META[server.vendor];
+  const meta = vendorMeta(server.vendor);
   const isUp = server.status === "up";
 
   const saveLicense = async () => {

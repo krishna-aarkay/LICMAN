@@ -1,0 +1,59 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: licman-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-licman}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-change-me-please}
+    volumes:
+      - mongo_data:/data/db
+    networks: [licman]
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: licman-backend
+    restart: unless-stopped
+    environment:
+      MONGO_URL: "mongodb://${MONGO_INITDB_ROOT_USERNAME:-licman}:${MONGO_INITDB_ROOT_PASSWORD:-change-me-please}@mongo:27017/?authSource=admin"
+      DB_NAME: ${MONGO_DB_NAME:-licman}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      DEMO_MODE: ${DEMO_MODE:-1}
+      TZ: ${TZ:-UTC}
+    depends_on: [mongo]
+    networks: [licman]
+    # SSH keys directory — mount your private keys here if you want them outside Mongo
+    volumes:
+      - ./ssh_keys:/etc/licman/keys:ro
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-}
+    container_name: licman-frontend
+    restart: unless-stopped
+    networks: [licman]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: licman-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on: [backend, frontend]
+    networks: [licman]
+
+volumes:
+  mongo_data:
+
+networks:
+  licman:
+    driver: bridge

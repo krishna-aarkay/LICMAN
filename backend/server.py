@@ -31,7 +31,8 @@ api_router = APIRouter(prefix="/api")
 
 # ------------------------- Models -------------------------
 
-Vendor = Literal["cadence", "synopsys", "mentor"]
+# Vendor is now a free-form string (cadence/synopsys/mentor/xilinx/defacto/ansys/...)
+Vendor = str
 
 
 class FeatureModel(BaseModel):
@@ -338,16 +339,69 @@ async def evaluate_alerts():
                 )
 
 
-# ---------- SSH adapter (mocked) ----------
+# ---------- SSH adapter (paramiko-ready) ----------
+try:
+    import paramiko  # type: ignore
+    PARAMIKO_AVAILABLE = True
+except Exception:
+    PARAMIKO_AVAILABLE = False
+
+
+def _ssh_real_exec(ssh_cfg: dict, command: str) -> dict:
+    """Execute a command on a remote host via paramiko. Returns dict with stdout/stderr/exit."""
+    if not PARAMIKO_AVAILABLE:
+        return {"mode": "ssh-error", "command": command,
+                "output": "paramiko not installed on backend host", "exit": -1}
+    host = ssh_cfg.get("host")
+    port = int(ssh_cfg.get("port", 22))
+    user = ssh_cfg.get("username")
+    if not host or not user:
+        return {"mode": "ssh-error", "command": command,
+                "output": "missing host or username", "exit": -1}
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        connect_kwargs = {"hostname": host, "port": port, "username": user, "timeout": 10}
+        if ssh_cfg.get("auth_method") == "password":
+            connect_kwargs["password"] = ssh_cfg.get("password", "")
+        else:
+            key_str = ssh_cfg.get("private_key", "")
+            if key_str:
+                from io import StringIO
+                pkey = None
+                for KCls in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
+                    try:
+                        pkey = KCls.from_private_key(StringIO(key_str))
+                        break
+                    except Exception:
+                        continue
+                if pkey is None:
+                    return {"mode": "ssh-error", "command": command,
+                            "output": "could not parse private key", "exit": -1}
+                connect_kwargs["pkey"] = pkey
+        client.connect(**connect_kwargs)
+        _stdin, stdout, stderr = client.exec_command(command, timeout=20)
+        out = stdout.read().decode("utf-8", "replace")
+        err = stderr.read().decode("utf-8", "replace")
+        rc = stdout.channel.recv_exit_status()
+        return {"mode": "ssh", "command": command,
+                "output": (out + err).strip() or "(no output)", "exit": rc}
+    except Exception as e:
+        return {"mode": "ssh-error", "command": command, "output": str(e), "exit": -1}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
 async def ssh_execute(server: dict, command: str) -> dict:
-    """Mocked SSH executor — records what *would* be executed when adapter_mode='ssh'."""
+    """Execute via real SSH when adapter_mode='ssh' and ssh.enabled. Otherwise mocked."""
     mode = server.get("adapter_mode", "mock")
     ssh = server.get("ssh", {}) or {}
     if mode == "ssh" and ssh.get("enabled"):
-        host = ssh.get("host") or server.get("host")
-        msg = f"[SSH STUB] would execute on {ssh.get('username','?')}@{host}:{ssh.get('port',22)} -> {command}"
-        return {"mode": "ssh-stub", "command": command, "output": msg}
-    return {"mode": "mock", "command": command, "output": f"[MOCK] {command} executed"}
+        return await asyncio.to_thread(_ssh_real_exec, ssh, command)
+    return {"mode": "mock", "command": command, "output": f"[MOCK] {command} executed", "exit": 0}
 
 
 
@@ -381,9 +435,9 @@ def default_options_text(vendor: str):
 
 SEED_SERVERS = [
     {
-        "name": "lic-cadence-prod-01",
+        "name": "cadence-prod-01",
         "vendor": "cadence",
-        "host": "lic-cadence-01.eda.local",
+        "host": "10.10.11.111",
         "port": 5280,
         "daemon": "cdslmd",
         "features": [
@@ -395,9 +449,22 @@ SEED_SERVERS = [
         ],
     },
     {
-        "name": "lic-synopsys-prod-01",
+        "name": "siemens-mentor-prod-01",
+        "vendor": "siemens",
+        "host": "10.10.11.112",
+        "port": 1717,
+        "daemon": "mgcld",
+        "features": [
+            {"name": "Calibre_DRC", "version": "2023.4", "total": 12, "expires": "30-sep-2026"},
+            {"name": "Calibre_LVS", "version": "2023.4", "total": 12, "expires": "30-sep-2026"},
+            {"name": "Questa_Sim", "version": "2023.3", "total": 24, "expires": "30-sep-2026"},
+            {"name": "Tessent_Shell", "version": "2023.3", "total": 4, "expires": "30-sep-2026"},
+        ],
+    },
+    {
+        "name": "synopsys-prod-01",
         "vendor": "synopsys",
-        "host": "lic-syn-01.eda.local",
+        "host": "10.10.11.113",
         "port": 27020,
         "daemon": "snpslmd",
         "features": [
@@ -408,23 +475,13 @@ SEED_SERVERS = [
             {"name": "Verdi", "version": "2023.06", "total": 20, "expires": "30-jun-2026"},
         ],
     },
-    {
-        "name": "lic-mentor-prod-01",
-        "vendor": "mentor",
-        "host": "lic-mgc-01.eda.local",
-        "port": 1717,
-        "daemon": "mgcld",
-        "features": [
-            {"name": "Calibre_DRC", "version": "2023.4", "total": 12, "expires": "30-sep-2026"},
-            {"name": "Calibre_LVS", "version": "2023.4", "total": 12, "expires": "30-sep-2026"},
-            {"name": "Questa_Sim", "version": "2023.3", "total": 24, "expires": "30-sep-2026"},
-            {"name": "Tessent_Shell", "version": "2023.3", "total": 4, "expires": "30-sep-2026"},
-        ],
-    },
 ]
 
 
 async def seed_if_empty():
+    # Skip seeding entirely when DEMO_MODE=0 (production install)
+    if os.environ.get("DEMO_MODE", "1") == "0":
+        return
     count = await db.servers.count_documents({})
     if count > 0:
         return

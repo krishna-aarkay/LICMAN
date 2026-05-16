@@ -35,7 +35,7 @@ def test_list_seed_servers(client):
     data = r.json()
     assert len(data) == 3
     vendors = sorted([s["vendor"] for s in data])
-    assert vendors == ["cadence", "mentor", "synopsys"]
+    assert vendors == ["cadence", "siemens", "synopsys"]
     for s in data:
         assert len(s["features"]) > 0
 

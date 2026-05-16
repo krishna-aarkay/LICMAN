@@ -53,11 +53,55 @@ export const api = {
   evaluateAlerts: () => http.post(`/alerts/evaluate`).then((r) => r.data),
 };
 
-export const VENDOR_META = {
-  cadence: { label: "CADENCE", color: "#ef4444", accent: "rgba(239,68,68,0.15)" },
-  synopsys: { label: "SYNOPSYS", color: "#f59e0b", accent: "rgba(245,158,11,0.15)" },
-  mentor: { label: "SIEMENS / MENTOR", color: "#3b82f6", accent: "rgba(59,130,246,0.15)" },
+const VENDOR_PRESETS = {
+  cadence: { label: "CADENCE", color: "#ef4444" },
+  synopsys: { label: "SYNOPSYS", color: "#f59e0b" },
+  mentor: { label: "SIEMENS / MENTOR", color: "#3b82f6" },
+  siemens: { label: "SIEMENS / MENTOR", color: "#3b82f6" },
+  xilinx: { label: "XILINX / AMD", color: "#8b5cf6" },
+  amd: { label: "AMD / XILINX", color: "#8b5cf6" },
+  defacto: { label: "DEFACTO", color: "#10b981" },
+  ansys: { label: "ANSYS", color: "#eab308" },
+  altair: { label: "ALTAIR", color: "#06b6d4" },
+  keysight: { label: "KEYSIGHT", color: "#f43f5e" },
+  intel: { label: "INTEL", color: "#0ea5e9" },
+  arm: { label: "ARM", color: "#22d3ee" },
 };
+
+// Deterministic palette for unknown vendors
+const FALLBACK_COLORS = [
+  "#a78bfa", "#fb7185", "#34d399", "#fbbf24", "#60a5fa",
+  "#f472b6", "#2dd4bf", "#fcd34d", "#c084fc", "#94a3b8",
+];
+
+function _hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h);
+}
+
+export function vendorMeta(vendor) {
+  if (!vendor) return { label: "UNKNOWN", color: "#6b7280", accent: "rgba(107,114,128,0.15)" };
+  const key = String(vendor).trim().toLowerCase();
+  if (VENDOR_PRESETS[key]) {
+    const m = VENDOR_PRESETS[key];
+    return { ...m, accent: m.color + "26" };
+  }
+  const color = FALLBACK_COLORS[_hashStr(key) % FALLBACK_COLORS.length];
+  return { label: vendor.toUpperCase(), color, accent: color + "26" };
+}
+
+// Backward-compat: VENDOR_META acts like a dict via Proxy
+export const VENDOR_META = new Proxy(VENDOR_PRESETS, {
+  get(target, key) {
+    if (typeof key !== "string") return undefined;
+    return vendorMeta(key);
+  },
+});
+
+export const KNOWN_VENDORS = Object.keys(VENDOR_PRESETS);
 
 export const fmtAgo = (iso) => {
   if (!iso) return "—";

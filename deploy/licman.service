@@ -1,0 +1,16 @@
+[Unit]
+Description=LICMAN — VLSI License Console (Docker Compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=/opt/licman/deploy
+ExecStart=/usr/bin/docker compose --env-file /opt/licman/deploy/.env up -d
+ExecStop=/usr/bin/docker compose --env-file /opt/licman/deploy/.env down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

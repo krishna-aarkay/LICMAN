@@ -1,10 +1,10 @@
 import { Link } from "react-router-dom";
 import { Server, Power, RefreshCw, ChevronRight } from "lucide-react";
-import { VENDOR_META, api } from "@/lib/api";
+import { vendorMeta, api } from "@/lib/api";
 import { toast } from "sonner";
 
 export const ServerCard = ({ server, onChange }) => {
-  const meta = VENDOR_META[server.vendor];
+  const meta = vendorMeta(server.vendor);
   const totalFeat = server.features?.length || 0;
   const totalSeats = server.features?.reduce((a, f) => a + f.total, 0) || 0;
   const isUp = server.status === "up";

@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { Calendar, Search } from "lucide-react";
-import { api, VENDOR_META } from "@/lib/api";
+import { api, vendorMeta } from "@/lib/api";
 import Header from "@/components/Header";
 import ExpiryBadge from "@/components/ExpiryBadge";
 
@@ -16,6 +16,11 @@ export default function Expiry() {
     api.expiry(180).then(setRows);
     api.stats().then(setStats);
   }, []);
+
+  const vendors = useMemo(() => {
+    const set = new Set(rows.map((r) => r.vendor).filter(Boolean));
+    return ["ALL", ...Array.from(set).sort()];
+  }, [rows]);
 
   const grouped = useMemo(() => {
     const filtered = rows.filter((r) => {
@@ -66,8 +71,8 @@ export default function Expiry() {
         {/* Toolbar */}
         <div className="bg-[#111] border border-[#222] rounded-sm">
           <div className="px-4 py-3 border-b border-[#222] flex items-center justify-between gap-3 flex-wrap">
-            <div className="flex items-center gap-1 bg-[#0a0a0a] border border-[#222]">
-              {["ALL", "cadence", "synopsys", "mentor"].map((v) => (
+            <div className="flex items-center gap-1 bg-[#0a0a0a] border border-[#222] flex-wrap">
+              {vendors.map((v) => (
                 <button
                   key={v}
                   onClick={() => setVendorFilter(v)}
@@ -122,7 +127,7 @@ export default function Expiry() {
               </thead>
               <tbody>
                 {grouped.map((r, i) => {
-                  const meta = VENDOR_META[r.vendor];
+                  const meta = vendorMeta(r.vendor);
                   return (
                     <tr
                       key={`${r.server_id}-${r.feature}`}

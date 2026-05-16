@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search } from "lucide-react";
-import { fmtAgo, VENDOR_META } from "@/lib/api";
+import { fmtAgo, vendorMeta } from "@/lib/api";
 import { prefs } from "@/lib/prefs";
 
 export const CheckoutTable = ({ rows, servers }) => {
@@ -16,6 +16,11 @@ export const CheckoutTable = ({ rows, servers }) => {
     const m = {};
     (servers || []).forEach((s) => (m[s.id] = s));
     return m;
+  }, [servers]);
+
+  const vendors = useMemo(() => {
+    const set = new Set((servers || []).map((s) => s.vendor).filter(Boolean));
+    return ["ALL", ...Array.from(set).sort()];
   }, [servers]);
 
   const filtered = useMemo(() => {
@@ -34,7 +39,7 @@ export const CheckoutTable = ({ rows, servers }) => {
       data-testid="checkouts-table"
     >
       {/* toolbar */}
-      <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-[#222]">
+      <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-[#222] flex-wrap">
         <div className="flex items-center gap-2">
           <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
             LIVE CHECKOUTS
@@ -43,9 +48,9 @@ export const CheckoutTable = ({ rows, servers }) => {
             [{filtered.length}]
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1 bg-[#0a0a0a] border border-[#222]">
-            {["ALL", "cadence", "synopsys", "mentor"].map((v) => (
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-1 bg-[#0a0a0a] border border-[#222] flex-wrap">
+            {vendors.map((v) => (
               <button
                 key={v}
                 onClick={() => setVendorFilter(v)}
@@ -94,7 +99,7 @@ export const CheckoutTable = ({ rows, servers }) => {
           <tbody>
             {filtered.map((r, i) => {
               const s = serverMap[r.server_id];
-              const meta = s ? VENDOR_META[s.vendor] : null;
+              const meta = s ? vendorMeta(s.vendor) : null;
               return (
                 <tr
                   key={r.id}
