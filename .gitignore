@@ -88,3 +88,8 @@ credentials.json
 *.pem
 *.key
 .credentials
+
+# Allow committed example/template env files (no secrets in them)
+!**/.env.example
+!**/.env.sample
+!**/env.example

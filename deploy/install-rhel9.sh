@@ -40,7 +40,20 @@ fi
 # --------------- 2. .env file ---------------
 if [[ ! -f .env ]]; then
     echo "[*] Creating .env from template (edit later if you wish)..."
-    cp .env.example .env
+    if   [[ -f env.example ]];   then cp env.example   .env
+    elif [[ -f .env.example ]];  then cp .env.example  .env
+    else
+        cat > .env <<'EOF'
+MONGO_INITDB_ROOT_USERNAME=licman
+MONGO_INITDB_ROOT_PASSWORD=change-me-please
+MONGO_DB_NAME=licman
+DEMO_MODE=0
+CORS_ORIGINS=*
+REACT_APP_BACKEND_URL=
+TZ=UTC
+EOF
+        echo "[!] env.example missing — wrote a default .env. EDIT IT BEFORE PRODUCTION USE."
+    fi
 fi
 
 # --------------- 3. Self-signed cert ---------------
