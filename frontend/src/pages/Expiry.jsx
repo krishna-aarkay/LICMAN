@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Calendar, Search } from "lucide-react";
+import { Calendar, Search, Download } from "lucide-react";
 import { api, vendorMeta } from "@/lib/api";
 import Header from "@/components/Header";
 import ExpiryBadge from "@/components/ExpiryBadge";
@@ -65,6 +65,14 @@ export default function Expiry() {
             <Tile label="WARN" n={summary.warning || 0} color="#f59e0b" />
             <Tile label="OK" n={summary.ok || 0} color="#10b981" />
             <Tile label="PERMANENT" n={summary.permanent || 0} color="#6b7280" />
+            <a
+              href={api.expiryExportUrl(180)}
+              className="btn-brutal flex items-center gap-1.5 ml-2"
+              data-testid="export-expiry-csv-btn"
+              title="Export current expiry table as CSV"
+            >
+              <Download size={11} /> EXPORT CSV
+            </a>
           </div>
         </div>
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Save, Send, Mail, BellRing, Info } from "lucide-react";
+import { Save, Send, Mail, BellRing, Info, Webhook, Download } from "lucide-react";
 import { api, fmtAgo } from "@/lib/api";
 import Header from "@/components/Header";
 import { toast } from "sonner";
@@ -11,6 +11,7 @@ export default function Settings() {
   const [alerts, setAlerts] = useState([]);
   const [dirty, setDirty] = useState(false);
   const [sending, setSending] = useState(false);
+  const [sendingWebhook, setSendingWebhook] = useState(false);
 
   const load = async () => {
     const [s, c, a] = await Promise.all([api.stats(), api.getSettings(), api.listAlerts(50)]);
@@ -56,6 +57,20 @@ export default function Settings() {
       toast.error(e?.response?.data?.detail || "Test failed");
     } finally {
       setSending(false);
+    }
+  };
+
+  const sendTestWebhook = async () => {
+    setSendingWebhook(true);
+    try {
+      const r = await api.testWebhook();
+      if (r.ok) toast.success("Test webhook delivered");
+      else toast.error(`Webhook error: ${r.error}`);
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Webhook test failed");
+    } finally {
+      setSendingWebhook(false);
     }
   };
 
@@ -248,6 +263,64 @@ export default function Settings() {
                 </div>
               </div>
             </Panel>
+
+            <Panel title="WEBHOOK (SLACK / TEAMS)" icon={Webhook}>
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-mono text-[10px] text-[#9ca3af]">
+                  Optional: post alerts to a Slack or Microsoft Teams incoming webhook.
+                  Useful when your CAD team lives in chat more than email.
+                </div>
+                <button
+                  className="btn-brutal flex items-center gap-1.5 text-[10px] py-1"
+                  onClick={sendTestWebhook}
+                  disabled={sendingWebhook || !cfg.webhook_url}
+                  data-testid="send-test-webhook-btn"
+                >
+                  <Send size={11} /> {sendingWebhook ? "SENDING…" : "TEST WEBHOOK"}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <Field label="Webhook URL" full>
+                  <input
+                    value={cfg.webhook_url || ""}
+                    onChange={(e) => upd({ webhook_url: e.target.value })}
+                    placeholder="https://hooks.slack.com/services/T000/B000/XXX"
+                    className="inp"
+                    data-testid="webhook-url"
+                  />
+                </Field>
+                <Field label="Webhook Flavor">
+                  <div className="flex border border-[#222]" data-testid="webhook-kind-toggle">
+                    {[
+                      { v: "slack", label: "SLACK" },
+                      { v: "teams", label: "TEAMS" },
+                      { v: "generic", label: "GENERIC" },
+                    ].map((opt) => (
+                      <button
+                        key={opt.v}
+                        onClick={() => upd({ webhook_kind: opt.v })}
+                        className={`flex-1 py-2 text-[10px] uppercase tracking-wider font-mono ${
+                          (cfg.webhook_kind || "generic") === opt.v
+                            ? "bg-white text-black"
+                            : "text-[#9ca3af] hover:bg-[#1a1a1a]"
+                        }`}
+                        data-testid={`webhook-kind-${opt.v}`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </Field>
+                <Toggle
+                  label="Webhook Enabled"
+                  value={cfg.webhook_enabled}
+                  onChange={(v) => upd({ webhook_enabled: v })}
+                  testid="webhook-enabled"
+                  wrapperTestid="webhook-enabled-toggle"
+                />
+              </div>
+            </Panel>
           </section>
 
           {/* Alerts log */}
@@ -256,7 +329,17 @@ export default function Settings() {
               <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
                 RECENT ALERTS
               </div>
-              <span className="font-mono text-xs text-emerald-400">[{alerts.length}]</span>
+              <div className="flex items-center gap-2">
+                <a
+                  href={api.auditExportUrl(1000)}
+                  className="font-mono text-[9px] uppercase tracking-wider text-[#9ca3af] hover:text-emerald-400 flex items-center gap-1"
+                  data-testid="export-audit-csv-btn"
+                  title="Download last 1000 audit events as CSV"
+                >
+                  <Download size={10} /> AUDIT CSV
+                </a>
+                <span className="font-mono text-xs text-emerald-400">[{alerts.length}]</span>
+              </div>
             </div>
             <div className="divide-y divide-[#1a1a1a] max-h-[70vh] overflow-y-auto">
               {alerts.map((a) => {

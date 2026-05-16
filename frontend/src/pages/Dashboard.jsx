@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback } from "react";
-import { Plus } from "lucide-react";
+import { Plus, RefreshCw, Zap } from "lucide-react";
 import { api } from "@/lib/api";
 import { prefs } from "@/lib/prefs";
+import { useAuth } from "@/contexts/AuthContext";
 import Header from "@/components/Header";
 import ServerCard from "@/components/ServerCard";
 import CheckoutTable from "@/components/CheckoutTable";
@@ -11,12 +12,14 @@ import { toast } from "sonner";
 
 export default function Dashboard() {
   const initial = prefs.load();
+  const { isAdmin } = useAuth();
   const [servers, setServers] = useState([]);
   const [checkouts, setCheckouts] = useState([]);
   const [audit, setAudit] = useState([]);
   const [stats, setStats] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(initial.autoRefresh);
   const [addOpen, setAddOpen] = useState(false);
+  const [busyBulk, setBusyBulk] = useState(null);
 
   const load = useCallback(async () => {
     try {
@@ -63,6 +66,38 @@ export default function Dashboard() {
     }
   };
 
+  const handleSyncAll = async () => {
+    setBusyBulk("sync");
+    try {
+      const r = await api.syncAll();
+      if (r.count === 0) {
+        toast.info("No SSH-enabled servers to sync");
+      } else {
+        toast.success(
+          `Synced ${r.count} server(s) · ${r.features_total} features · ${r.checkouts_total} checkouts`
+        );
+      }
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Bulk sync failed");
+    } finally {
+      setBusyBulk(null);
+    }
+  };
+
+  const handleRereadAll = async () => {
+    setBusyBulk("reread");
+    try {
+      const r = await api.rereadAll();
+      toast.success(`lmreread issued to ${r.count} server(s)`);
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Bulk lmreread failed");
+    } finally {
+      setBusyBulk(null);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#050505]" data-testid="dashboard-page">
       <Header
@@ -84,13 +119,39 @@ export default function Dashboard() {
                 Control Room
               </h1>
             </div>
-            <button
-              onClick={() => setAddOpen(true)}
-              className="btn-brutal primary flex items-center gap-2"
-              data-testid="add-server-btn"
-            >
-              <Plus size={14} /> ADD SERVER
-            </button>
+            <div className="flex items-center gap-2">
+              {isAdmin && servers.length > 0 && (
+                <>
+                  <button
+                    onClick={handleSyncAll}
+                    disabled={busyBulk !== null}
+                    className="btn-brutal flex items-center gap-2 disabled:opacity-50"
+                    data-testid="sync-all-btn"
+                    title="Run lmstat across every SSH-enabled server"
+                  >
+                    <RefreshCw size={12} className={busyBulk === "sync" ? "animate-spin" : ""} />
+                    {busyBulk === "sync" ? "SYNCING…" : "SYNC ALL"}
+                  </button>
+                  <button
+                    onClick={handleRereadAll}
+                    disabled={busyBulk !== null}
+                    className="btn-brutal flex items-center gap-2 disabled:opacity-50"
+                    data-testid="reread-all-btn"
+                    title="Issue lmreread to every server"
+                  >
+                    <Zap size={12} />
+                    {busyBulk === "reread" ? "RUNNING…" : "REREAD ALL"}
+                  </button>
+                </>
+              )}
+              <button
+                onClick={() => setAddOpen(true)}
+                className="btn-brutal primary flex items-center gap-2"
+                data-testid="add-server-btn"
+              >
+                <Plus size={14} /> ADD SERVER
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">

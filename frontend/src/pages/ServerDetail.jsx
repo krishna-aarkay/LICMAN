@@ -43,6 +43,8 @@ export default function ServerDetail() {
   const [resDialogOpen, setResDialogOpen] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(prefs.load().autoRefresh);
   const [stats, setStats] = useState(null);
+  const [optValidation, setOptValidation] = useState(null);
+  const [validating, setValidating] = useState(false);
 
   // remember last visited server
   useEffect(() => {
@@ -108,6 +110,20 @@ export default function ServerDetail() {
       load();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Save failed");
+    }
+  };
+
+  const validateOpts = async () => {
+    setValidating(true);
+    try {
+      const r = await api.validateOptions(id, optText);
+      setOptValidation(r);
+      if (r.ok) toast.success(`Options syntax OK · ${r.warnings} warning(s)`);
+      else toast.error(`${r.errors} error(s) · ${r.warnings} warning(s)`);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Validation failed");
+    } finally {
+      setValidating(false);
     }
   };
 
@@ -386,16 +402,86 @@ export default function ServerDetail() {
               testId="options-panel"
               saveTestId="save-options-btn"
               hint="Directives: RESERVE | INCLUDE | EXCLUDE | GROUP | MAX | TIMEOUT"
+              extraActions={
+                <button
+                  onClick={validateOpts}
+                  disabled={validating}
+                  className="btn-brutal flex items-center gap-1.5 disabled:opacity-50"
+                  data-testid="validate-options-btn"
+                  title="Lint the options file against FlexLM directive syntax"
+                >
+                  <ListChecks size={12} />
+                  {validating ? "VALIDATING…" : "VALIDATE"}
+                </button>
+              }
             >
               <CodeEditor
                 value={optText}
                 onChange={(v) => {
                   setOptText(v);
                   setOptDirty(true);
+                  setOptValidation(null);
                 }}
                 language="options"
                 testId="options-editor"
               />
+              {optValidation && (
+                <div
+                  className="mt-3 border border-[#222] bg-[#0a0a0a] rounded-sm"
+                  data-testid="options-validation-result"
+                >
+                  <div className="px-3 py-2 border-b border-[#222] flex items-center justify-between flex-wrap gap-2 font-mono text-[10px] uppercase tracking-wider">
+                    <span className="text-[#9ca3af]">VALIDATION</span>
+                    <div className="flex items-center gap-3">
+                      <span
+                        className="font-bold"
+                        style={{ color: optValidation.ok ? "#10b981" : "#ef4444" }}
+                      >
+                        {optValidation.ok ? "PASS" : "FAIL"}
+                      </span>
+                      <span className="text-red-400">{optValidation.errors} err</span>
+                      <span className="text-amber-400">{optValidation.warnings} warn</span>
+                      <span className="text-[#6b7280]">
+                        · RES {optValidation.summary.reserve} · GRP {optValidation.summary.group} ·
+                        INC {optValidation.summary.include} · EXC {optValidation.summary.exclude} ·
+                        MAX {optValidation.summary.max} · TO {optValidation.summary.timeout}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto">
+                    {optValidation.issues.length === 0 ? (
+                      <div className="px-3 py-3 font-mono text-[11px] text-emerald-400">
+                        ✓ no issues — directives parse cleanly
+                      </div>
+                    ) : (
+                      <table className="w-full font-mono text-[11px]">
+                        <tbody>
+                          {optValidation.issues.map((iss, i) => (
+                            <tr
+                              key={i}
+                              className="border-t border-[#1a1a1a]"
+                              data-testid={`options-issue-${i}`}
+                            >
+                              <td className="px-3 py-1.5 text-[#6b7280] w-16 tabular-nums">
+                                line {iss.line}
+                              </td>
+                              <td
+                                className="px-2 py-1.5 uppercase text-[10px] tracking-wider w-20"
+                                style={{
+                                  color: iss.severity === "error" ? "#ef4444" : "#f59e0b",
+                                }}
+                              >
+                                {iss.severity}
+                              </td>
+                              <td className="px-3 py-1.5 text-white">{iss.message}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+              )}
             </EditorPanel>
           </TabsContent>
 

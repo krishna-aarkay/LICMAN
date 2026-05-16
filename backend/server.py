@@ -1,4 +1,10 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
+from fastapi.responses import PlainTextResponse
+import csv as _csv
+import io as _io
+import json as _json
+import urllib.request as _urlreq
+import urllib.error as _urlerr
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -145,6 +151,9 @@ class AlertSettings(BaseModel):
     alert_on_saturation: bool = True
     alert_on_expiry: bool = True
     expiry_warn_days: int = 30
+    webhook_url: str = ""
+    webhook_kind: Literal["slack", "teams", "generic", ""] = ""
+    webhook_enabled: bool = False
 
 
 class AlertEvent(BaseModel):
@@ -266,6 +275,10 @@ async def get_alert_settings(*, decrypt_smtp: bool = True) -> dict:
     if not doc:
         return AlertSettings().model_dump()
     doc.pop("_key", None)
+    # Backfill new fields so older DB records expose webhook_* keys to the UI
+    defaults = AlertSettings().model_dump()
+    for k, v in defaults.items():
+        doc.setdefault(k, v)
     if decrypt_smtp and doc.get("smtp_password"):
         doc["smtp_password"] = decrypt_secret(doc["smtp_password"])
     return doc
@@ -297,6 +310,42 @@ def send_smtp_email(cfg: dict, subject: str, body: str) -> tuple[bool, Optional[
         return False, str(e)
 
 
+def send_webhook(cfg: dict, kind: str, subject: str, body: str) -> tuple[bool, Optional[str]]:
+    """POST a Slack/Teams/generic webhook message. Returns (ok, error).
+    Keeps no external deps — uses urllib so the air-gapped wheelhouse stays small."""
+    url = (cfg.get("webhook_url") or "").strip()
+    if not (cfg.get("webhook_enabled") and url):
+        return False, "webhook not configured"
+    flavor = (cfg.get("webhook_kind") or "generic").lower()
+    color = {"saturation": "#f59e0b", "expiry": "#ef4444", "test": "#3b82f6"}.get(kind, "#9ca3af")
+    try:
+        if flavor == "slack":
+            payload = {
+                "text": f"*{subject}*\n{body}",
+                "attachments": [{"color": color, "text": body, "ts": int(datetime.now(timezone.utc).timestamp())}],
+            }
+        elif flavor == "teams":
+            payload = {
+                "@type": "MessageCard", "@context": "https://schema.org/extensions",
+                "themeColor": color.lstrip("#"),
+                "summary": subject, "title": subject, "text": body,
+            }
+        else:
+            payload = {"kind": kind, "subject": subject, "body": body,
+                       "timestamp": datetime.now(timezone.utc).isoformat()}
+        data = _json.dumps(payload).encode("utf-8")
+        req = _urlreq.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with _urlreq.urlopen(req, timeout=8) as resp:  # nosec - operator-supplied URL
+            code = resp.getcode()
+            if 200 <= code < 300:
+                return True, None
+            return False, f"webhook HTTP {code}"
+    except _urlerr.HTTPError as e:
+        return False, f"webhook HTTP {e.code}"
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 async def _alert_throttled(kind: str, server_id: Optional[str], feature: Optional[str]) -> bool:
     """Return True if a similar alert was fired in last 6 hours."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
@@ -318,9 +367,17 @@ async def trigger_alert(kind: str, detail: str, server_id: Optional[str] = None,
     if cfg.get("enabled") and enable_flag:
         subject = f"[LICMAN] {kind.upper()} — {server_name or 'server'} · {feature or ''}".strip()
         delivered, err = send_smtp_email(cfg, subject, detail)
+    # Webhook (Slack/Teams) — fired in addition to email, independent of SMTP enable flag
+    webhook_delivered, webhook_err = False, None
+    if enable_flag and cfg.get("webhook_enabled") and cfg.get("webhook_url"):
+        subject = f"[LICMAN] {kind.upper()} — {server_name or 'server'} · {feature or ''}".strip()
+        webhook_delivered, webhook_err = send_webhook(cfg, kind, subject, detail)
+    # Merge delivery flags — at least one channel succeeded counts as delivered
+    final_delivered = bool(delivered or webhook_delivered)
+    final_err = err if err else webhook_err
     ev = AlertEvent(
         kind=kind, server_id=server_id, server_name=server_name,
-        feature=feature, detail=detail, delivered=delivered, error=err  # type: ignore
+        feature=feature, detail=detail, delivered=final_delivered, error=final_err  # type: ignore
     )
     await db.alert_events.insert_one(ev.model_dump())
     sev = "warning" if kind == "saturation" else ("error" if kind == "expiry" else "info")
@@ -1396,6 +1453,164 @@ async def fetch_license(server_id: str, _: dict = Depends(require_admin)):
     return {"ok": True, "path": lic_path, "bytes": len(content)}
 
 
+# ---------- Bulk operations ----------
+
+@api_router.post("/servers/sync-all")
+async def sync_all_servers(_: dict = Depends(require_admin)):
+    """Run lmstat sync over SSH for every adapter_mode='ssh' & ssh.enabled server."""
+    servers = await db.servers.find(
+        {"adapter_mode": "ssh", "ssh.enabled": True}, {"_id": 0}
+    ).to_list(500)
+    results = []
+    total_feats = 0
+    total_co = 0
+    for srv in servers:
+        try:
+            parsed = await _real_checkouts_via_ssh(srv)
+            if parsed is None:
+                results.append({"server_id": srv["id"], "name": srv["name"],
+                                "ok": False, "error": "lmstat failed"})
+                continue
+            update = {"last_sync": datetime.now(timezone.utc).isoformat()}
+            if parsed["features"]:
+                update["features"] = parsed["features"]
+            await db.servers.update_one({"id": srv["id"]}, {"$set": update})
+            await db.checkouts.delete_many({"server_id": srv["id"]})
+            if parsed["checkouts"]:
+                await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+            total_feats += len(parsed["features"])
+            total_co += len(parsed["checkouts"])
+            results.append({
+                "server_id": srv["id"], "name": srv["name"], "ok": True,
+                "features": len(parsed["features"]),
+                "checkouts": len(parsed["checkouts"]),
+            })
+        except Exception as e:
+            results.append({"server_id": srv["id"], "name": srv["name"],
+                            "ok": False, "error": str(e)[:200]})
+    await log_audit("SYNC_ALL",
+                    f"Bulk sync: {len(servers)} server(s), {total_feats} features, {total_co} checkouts",
+                    None, None, "success")
+    return {"ok": True, "count": len(servers), "features_total": total_feats,
+            "checkouts_total": total_co, "results": results}
+
+
+@api_router.post("/servers/reread-all")
+async def reread_all_servers(_: dict = Depends(require_admin)):
+    """Issue lmreread to every server. Uses SSH if enabled, otherwise mock."""
+    servers = await db.servers.find({}, {"_id": 0}).to_list(500)
+    results = []
+    for srv in servers:
+        try:
+            exec_log = await ssh_execute(srv, f"lmreread -c @{srv['port']}@{srv['host']}")
+            await db.servers.update_one(
+                {"id": srv["id"]},
+                {"$set": {"status": "up",
+                          "last_action": f"lmreread [{exec_log['mode']}] @ {datetime.now(timezone.utc).isoformat()}"}}
+            )
+            results.append({"server_id": srv["id"], "name": srv["name"], "ok": True,
+                            "mode": exec_log.get("mode")})
+        except Exception as e:
+            results.append({"server_id": srv["id"], "name": srv["name"],
+                            "ok": False, "error": str(e)[:200]})
+    await log_audit("REREAD_ALL", f"Bulk lmreread: {len(servers)} server(s)", None, None, "info")
+    return {"ok": True, "count": len(servers), "results": results}
+
+
+# ---------- Options file validator ----------
+
+class OptionsValidatePayload(BaseModel):
+    content: str
+
+
+_OPT_KEYWORDS = {
+    "RESERVE", "INCLUDE", "EXCLUDE", "INCLUDEALL", "EXCLUDEALL",
+    "INCLUDE_BORROW", "EXCLUDE_BORROW",
+    "MAX", "MAX_BORROW_HOURS", "MAX_OVERDRAFT",
+    "TIMEOUT", "TIMEOUTALL", "LINGER", "REPORTLOG", "DEBUGLOG",
+    "GROUP", "HOST_GROUP", "NOLOG", "GROUPCASEINSENSITIVE",
+}
+_OPT_TARGETS = {"USER", "HOST", "GROUP", "HOST_GROUP", "INTERNET", "PROJECT", "DISPLAY"}
+
+
+@api_router.post("/servers/{server_id}/options/validate")
+async def validate_options(server_id: str, payload: OptionsValidatePayload):
+    """Light syntax check for FlexLM options files. Returns warnings/errors with line numbers."""
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0, "name": 1})
+    if not srv:
+        raise HTTPException(404, "Server not found")
+    issues = []
+    summary = {"reserve": 0, "include": 0, "exclude": 0, "group": 0, "max": 0, "timeout": 0}
+    for ln, raw in enumerate(payload.content.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        kw = parts[0].upper()
+        if kw not in _OPT_KEYWORDS:
+            issues.append({"line": ln, "severity": "error",
+                           "message": f"Unknown directive: {parts[0]}"})
+            continue
+        # Bucket counts
+        if kw == "RESERVE":
+            summary["reserve"] += 1
+        elif kw.startswith("INCLUDE"):
+            summary["include"] += 1
+        elif kw.startswith("EXCLUDE"):
+            summary["exclude"] += 1
+        elif kw in ("GROUP", "HOST_GROUP"):
+            summary["group"] += 1
+        elif kw.startswith("MAX"):
+            summary["max"] += 1
+        elif kw.startswith("TIMEOUT"):
+            summary["timeout"] += 1
+        # Per-keyword arg validation
+        if kw == "RESERVE":
+            if len(parts) < 4:
+                issues.append({"line": ln, "severity": "error",
+                               "message": "RESERVE requires: count feature TYPE name"})
+            else:
+                if not parts[1].isdigit():
+                    issues.append({"line": ln, "severity": "error",
+                                   "message": "RESERVE count must be an integer"})
+                if parts[3].upper() not in _OPT_TARGETS:
+                    issues.append({"line": ln, "severity": "warning",
+                                   "message": f"Unknown RESERVE target type: {parts[3]}"})
+        elif kw in ("INCLUDE", "EXCLUDE", "INCLUDE_BORROW", "EXCLUDE_BORROW"):
+            if len(parts) < 4:
+                issues.append({"line": ln, "severity": "error",
+                               "message": f"{kw} requires: feature TYPE name"})
+            elif parts[2].upper() not in _OPT_TARGETS:
+                issues.append({"line": ln, "severity": "warning",
+                               "message": f"Unknown {kw} target type: {parts[2]}"})
+        elif kw in ("INCLUDEALL", "EXCLUDEALL"):
+            if len(parts) < 3:
+                issues.append({"line": ln, "severity": "error",
+                               "message": f"{kw} requires: TYPE name"})
+            elif parts[1].upper() not in _OPT_TARGETS:
+                issues.append({"line": ln, "severity": "warning",
+                               "message": f"Unknown {kw} target type: {parts[1]}"})
+        elif kw == "GROUP" or kw == "HOST_GROUP":
+            if len(parts) < 3:
+                issues.append({"line": ln, "severity": "error",
+                               "message": f"{kw} requires: name member1 [member2 ...]"})
+        elif kw == "TIMEOUT":
+            if len(parts) < 3 or not parts[2].isdigit():
+                issues.append({"line": ln, "severity": "error",
+                               "message": "TIMEOUT requires: feature seconds"})
+        elif kw == "TIMEOUTALL":
+            if len(parts) < 2 or not parts[1].isdigit():
+                issues.append({"line": ln, "severity": "error",
+                               "message": "TIMEOUTALL requires: seconds"})
+        elif kw == "MAX":
+            if len(parts) < 4:
+                issues.append({"line": ln, "severity": "error",
+                               "message": "MAX requires: count feature TYPE name"})
+    error_count = sum(1 for i in issues if i["severity"] == "error")
+    return {"ok": error_count == 0, "issues": issues, "summary": summary,
+            "errors": error_count, "warnings": len(issues) - error_count}
+
+
 # ---------- Expiry ----------
 
 @api_router.get("/expiry")
@@ -1433,6 +1648,46 @@ async def expiry_calendar(warn_days: int = 90):
         return (1, r["days_remaining"])
     rows.sort(key=sk)
     return rows
+
+
+@api_router.get("/expiry/export")
+async def expiry_export(warn_days: int = 90):
+    """Stream the expiry calendar as CSV for spreadsheet/ticketing workflows."""
+    rows = await expiry_calendar(warn_days=warn_days)
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["vendor", "server_name", "feature", "version", "total",
+                "expires", "expires_iso", "days_remaining", "status"])
+    for r in rows:
+        w.writerow([r.get("vendor", ""), r.get("server_name", ""), r.get("feature", ""),
+                    r.get("version", ""), r.get("total", ""), r.get("expires", ""),
+                    r.get("expires_iso", "") or "", r.get("days_remaining") if r.get("days_remaining") is not None else "",
+                    r.get("status", "")])
+    filename = f"licman-expiry-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@api_router.get("/audit/export")
+async def audit_export(limit: int = 1000):
+    """Stream recent audit log entries as CSV for compliance / change-control reviews."""
+    docs = await db.audit.find({}, {"_id": 0, "ts": 0}).sort("timestamp", -1).to_list(limit)
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["timestamp", "actor", "severity", "action", "server_name", "server_id", "detail"])
+    for d in docs:
+        w.writerow([d.get("timestamp", ""), d.get("actor", ""), d.get("severity", ""),
+                    d.get("action", ""), d.get("server_name", "") or "",
+                    d.get("server_id", "") or "", d.get("detail", "")])
+    filename = f"licman-audit-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------- Settings / Alerts ----------
@@ -1482,6 +1737,26 @@ async def test_email(_: dict = Depends(require_admin)):
     )
     await db.alert_events.insert_one(ev.model_dump())
     await log_audit("ALERT_TEST", f"Test email: delivered={ok} err={err}", None, None,
+                    "success" if ok else "error")
+    return {"ok": ok, "error": err}
+
+
+@api_router.post("/settings/test-webhook")
+async def test_webhook(_: dict = Depends(require_admin)):
+    cfg = await get_alert_settings()
+    if not cfg.get("webhook_url"):
+        raise HTTPException(400, "Webhook URL not configured")
+    cfg2 = {**cfg, "webhook_enabled": True}
+    ok, err = send_webhook(
+        cfg2, "test", "[LICMAN] Test webhook",
+        "This is a test alert from LICMAN. If you receive this, the webhook works.",
+    )
+    ev = AlertEvent(
+        kind="test", detail=f"Test webhook -> {cfg.get('webhook_kind') or 'generic'}",
+        delivered=ok, error=err  # type: ignore
+    )
+    await db.alert_events.insert_one(ev.model_dump())
+    await log_audit("ALERT_WEBHOOK_TEST", f"Webhook test delivered={ok} err={err}", None, None,
                     "success" if ok else "error")
     return {"ok": ok, "error": err}
 

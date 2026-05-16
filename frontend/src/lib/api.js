@@ -56,6 +56,10 @@ export const api = {
   restart: (id) => http.post(`/servers/${id}/restart`).then((r) => r.data),
   toggle: (id) => http.post(`/servers/${id}/toggle`).then((r) => r.data),
   sync: (id) => http.post(`/servers/${id}/sync`).then((r) => r.data),
+  syncAll: () => http.post(`/servers/sync-all`).then((r) => r.data),
+  rereadAll: () => http.post(`/servers/reread-all`).then((r) => r.data),
+  validateOptions: (id, content) =>
+    http.post(`/servers/${id}/options/validate`, { content }).then((r) => r.data),
   fetchLicense: (id) => http.post(`/servers/${id}/fetch-license`).then((r) => r.data),
   saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
   setAdapter: (id, mode) =>
@@ -83,9 +87,13 @@ export const api = {
   // expiry / settings / alerts
   expiry: (warn_days = 90) =>
     http.get(`/expiry`, { params: { warn_days } }).then((r) => r.data),
+  expiryExportUrl: (warn_days = 180) =>
+    `${API}/expiry/export?warn_days=${warn_days}`,
+  auditExportUrl: (limit = 1000) => `${API}/audit/export?limit=${limit}`,
   getSettings: () => http.get(`/settings`).then((r) => r.data),
   saveSettings: (data) => http.put(`/settings`, data).then((r) => r.data),
   testEmail: () => http.post(`/settings/test-email`).then((r) => r.data),
+  testWebhook: () => http.post(`/settings/test-webhook`).then((r) => r.data),
   listAlerts: (limit = 50) =>
     http.get(`/alerts`, { params: { limit } }).then((r) => r.data),
   evaluateAlerts: () => http.post(`/alerts/evaluate`).then((r) => r.data),
