@@ -49,11 +49,23 @@ MONGO_INITDB_ROOT_PASSWORD=change-me-please
 MONGO_DB_NAME=licman
 DEMO_MODE=0
 CORS_ORIGINS=*
+JWT_SECRET=
 REACT_APP_BACKEND_URL=
 TZ=UTC
 EOF
         echo "[!] env.example missing — wrote a default .env. EDIT IT BEFORE PRODUCTION USE."
     fi
+fi
+
+# Auto-generate JWT_SECRET if absent or empty
+if ! grep -E '^JWT_SECRET=.+' .env >/dev/null 2>&1; then
+    NEW_JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(64))" 2>/dev/null || openssl rand -hex 64)
+    if grep -q '^JWT_SECRET=' .env; then
+        sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${NEW_JWT_SECRET}|" .env
+    else
+        echo "JWT_SECRET=${NEW_JWT_SECRET}" >> .env
+    fi
+    echo "[*] Generated random JWT_SECRET (stored in .env)"
 fi
 
 # --------------- 3. Self-signed cert ---------------

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,6 +9,9 @@ import re
 import smtplib
 import ssl
 import asyncio
+import secrets as _secrets
+import bcrypt
+import jwt as pyjwt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -26,7 +29,14 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 app = FastAPI(title="LICMAN — VLSI License Console")
-api_router = APIRouter(prefix="/api")
+async def _require_auth(request: Request):
+    """Wrapper that defers to get_current_user (defined later in file)."""
+    return await get_current_user(request)
+
+
+api_router = APIRouter(prefix="/api", dependencies=[Depends(_require_auth)])
+# Public sub-router (no auth) — carries /api/, /api/setup-status
+public_router = APIRouter(prefix="/api")
 
 
 # ------------------------- Models -------------------------
@@ -497,11 +507,341 @@ async def seed_if_empty():
         await log_audit("SEED", f"Seeded server {s['name']}", server.id, s["name"], "info")
 
 
+# ------------------------- AUTH (JWT + bcrypt) -------------------------
+
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_MINUTES = 15
+REFRESH_TOKEN_DAYS = 7
+LOCKOUT_THRESHOLD = 5
+LOCKOUT_MINUTES = 15
+
+
+def _jwt_secret() -> str:
+    sec = os.environ.get("JWT_SECRET")
+    if not sec or len(sec) < 16:
+        raise RuntimeError(
+            "JWT_SECRET environment variable is missing or too short. "
+            "Generate one with:  python -c \"import secrets; print(secrets.token_hex(64))\""
+        )
+    return sec
+
+
+Role = Literal["admin", "engineer"]
+
+
+class UserPublic(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    email: EmailStr
+    name: str = ""
+    role: Role
+    active: bool = True
+    created_at: str
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    name: str = ""
+    role: Role = "engineer"
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[Role] = None
+    active: Optional[bool] = None
+    password: Optional[str] = Field(default=None, min_length=8)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class SetupRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    name: str = "Administrator"
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _create_token(payload: dict, minutes: int = ACCESS_TOKEN_MINUTES, kind: str = "access") -> str:
+    now = datetime.now(timezone.utc)
+    body = {
+        **payload,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=minutes)).timestamp()),
+        "type": kind,
+    }
+    return pyjwt.encode(body, _jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+def create_access_token(user: dict) -> str:
+    return _create_token(
+        {"sub": user["id"], "email": user["email"], "role": user["role"]},
+        minutes=ACCESS_TOKEN_MINUTES, kind="access",
+    )
+
+
+def create_refresh_token(user: dict) -> str:
+    return _create_token(
+        {"sub": user["id"]},
+        minutes=REFRESH_TOKEN_DAYS * 24 * 60, kind="refresh",
+    )
+
+
+def _set_auth_cookies(response: Response, access: str, refresh: str):
+    common = dict(httponly=True, samesite="lax", secure=False, path="/")
+    response.set_cookie("access_token",  access,  max_age=ACCESS_TOKEN_MINUTES * 60, **common)
+    response.set_cookie("refresh_token", refresh, max_age=REFRESH_TOKEN_DAYS * 86400, **common)
+
+
+def _clear_auth_cookies(response: Response):
+    response.delete_cookie("access_token",  path="/")
+    response.delete_cookie("refresh_token", path="/")
+
+
+def _user_public(doc: dict) -> dict:
+    return {
+        "id": doc["id"],
+        "email": doc["email"],
+        "name": doc.get("name", ""),
+        "role": doc.get("role", "engineer"),
+        "active": doc.get("active", True),
+        "created_at": doc.get("created_at"),
+    }
+
+
+def _read_token(request: Request) -> Optional[str]:
+    tok = request.cookies.get("access_token")
+    if tok:
+        return tok
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return None
+
+
+async def get_current_user(request: Request) -> dict:
+    token = _read_token(request)
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        payload = pyjwt.decode(token, _jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(401, "Invalid token type")
+        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+        if not user or not user.get("active", True):
+            raise HTTPException(401, "User not found or disabled")
+        return user
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin role required")
+    return user
+
+
+# ----- Brute-force protection -----
+
+async def _is_locked_out(identifier: str) -> bool:
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
+    n = await db.login_attempts.count_documents({
+        "identifier": identifier, "ts": {"$gt": cutoff}
+    })
+    return n >= LOCKOUT_THRESHOLD
+
+
+async def _record_failed_login(identifier: str):
+    await db.login_attempts.insert_one({
+        "identifier": identifier, "ts": datetime.now(timezone.utc).isoformat()
+    })
+
+
+async def _clear_failed_logins(identifier: str):
+    await db.login_attempts.delete_many({"identifier": identifier})
+
+
+# ----- Auth routes -----
+
+auth_router = APIRouter(prefix="/api/auth")
+
+
+@auth_router.post("/setup")
+async def auth_setup(payload: SetupRequest, response: Response):
+    if (await db.users.count_documents({})) > 0:
+        raise HTTPException(400, "Setup already complete")
+    email = payload.email.lower()
+    user_doc = {
+        "id": str(uuid.uuid4()),
+        "email": email,
+        "name": payload.name or "Administrator",
+        "role": "admin",
+        "active": True,
+        "password_hash": hash_password(payload.password),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.users.insert_one(user_doc)
+    await log_audit("AUTH_SETUP", f"First-run admin created: {email}", None, None, "success")
+    access  = create_access_token(user_doc)
+    refresh = create_refresh_token(user_doc)
+    _set_auth_cookies(response, access, refresh)
+    return {"user": _user_public(user_doc), "access_token": access}
+
+
+@auth_router.post("/login")
+async def auth_login(payload: LoginRequest, request: Request, response: Response):
+    email = payload.email.lower()
+    ident = f"{request.client.host if request.client else 'na'}:{email}"
+    if await _is_locked_out(ident):
+        raise HTTPException(429, f"Too many failed attempts — locked for {LOCKOUT_MINUTES} minutes")
+    user = await db.users.find_one({"email": email})
+    if not user or not user.get("active", True) or not verify_password(payload.password, user.get("password_hash", "")):
+        await _record_failed_login(ident)
+        raise HTTPException(401, "Invalid credentials")
+    await _clear_failed_logins(ident)
+    access  = create_access_token(user)
+    refresh = create_refresh_token(user)
+    _set_auth_cookies(response, access, refresh)
+    await log_audit("AUTH_LOGIN", f"{email} logged in", None, None, "info")
+    return {"user": _user_public(user), "access_token": access}
+
+
+@auth_router.get("/me")
+async def auth_me(user: dict = Depends(get_current_user)):
+    return _user_public(user)
+
+
+@auth_router.post("/refresh")
+async def auth_refresh(request: Request, response: Response):
+    rtok = request.cookies.get("refresh_token") or ""
+    if not rtok:
+        raise HTTPException(401, "No refresh token")
+    try:
+        payload = pyjwt.decode(rtok, _jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(401, "Invalid token type")
+        user = await db.users.find_one({"id": payload["sub"]})
+        if not user or not user.get("active", True):
+            raise HTTPException(401, "User not found")
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(401, "Refresh token expired")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid refresh token")
+    access = create_access_token(user)
+    response.set_cookie("access_token", access, max_age=ACCESS_TOKEN_MINUTES * 60,
+                        httponly=True, samesite="lax", secure=False, path="/")
+    return {"access_token": access, "user": _user_public(user)}
+
+
+@auth_router.post("/logout")
+async def auth_logout(response: Response, user: dict = Depends(get_current_user)):
+    _clear_auth_cookies(response)
+    await log_audit("AUTH_LOGOUT", f"{user['email']} logged out", None, None, "info")
+    return {"ok": True}
+
+
+# ----- User management (admin) -----
+
+@api_router.get("/users", response_model=List[UserPublic])
+async def list_users(_: dict = Depends(require_admin)):
+    docs = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(500)
+    return [_user_public(d) for d in docs]
+
+
+@api_router.post("/users", response_model=UserPublic)
+async def create_user(payload: UserCreate, admin: dict = Depends(require_admin)):
+    email = payload.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(409, "Email already exists")
+    user_doc = {
+        "id": str(uuid.uuid4()),
+        "email": email,
+        "name": payload.name,
+        "role": payload.role,
+        "active": True,
+        "password_hash": hash_password(payload.password),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.users.insert_one(user_doc)
+    await log_audit("USER_CREATE", f"{admin['email']} created {email} ({payload.role})",
+                    None, None, "success")
+    return _user_public(user_doc)
+
+
+@api_router.patch("/users/{user_id}", response_model=UserPublic)
+async def update_user(user_id: str, payload: UserUpdate, admin: dict = Depends(require_admin)):
+    target = await db.users.find_one({"id": user_id})
+    if not target:
+        raise HTTPException(404, "User not found")
+    update: dict = {}
+    if payload.name is not None:
+        update["name"] = payload.name
+    if payload.role is not None:
+        update["role"] = payload.role
+    if payload.active is not None:
+        update["active"] = payload.active
+    if payload.password is not None:
+        update["password_hash"] = hash_password(payload.password)
+    # Guard: don't lock the last admin out of admin role / deactivate them
+    if (payload.role == "engineer" or payload.active is False) and target.get("role") == "admin":
+        admins_left = await db.users.count_documents({"role": "admin", "active": True})
+        if admins_left <= 1:
+            raise HTTPException(400, "Cannot demote/disable the last active admin")
+    if not update:
+        raise HTTPException(400, "No fields to update")
+    await db.users.update_one({"id": user_id}, {"$set": update})
+    doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    await log_audit("USER_UPDATE", f"{admin['email']} updated {target['email']}: {list(update.keys())}",
+                    None, None, "info")
+    return _user_public(doc)
+
+
+@api_router.delete("/users/{user_id}")
+async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
+    target = await db.users.find_one({"id": user_id})
+    if not target:
+        raise HTTPException(404, "User not found")
+    if target["id"] == admin["id"]:
+        raise HTTPException(400, "Cannot delete yourself")
+    if target.get("role") == "admin":
+        admins_left = await db.users.count_documents({"role": "admin", "active": True})
+        if admins_left <= 1:
+            raise HTTPException(400, "Cannot delete the last active admin")
+    await db.users.delete_one({"id": user_id})
+    await log_audit("USER_DELETE", f"{admin['email']} deleted {target['email']}",
+                    None, None, "warning")
+    return {"ok": True}
+
+
+# ------------------------- end AUTH -------------------------
+
+
 # ------------------------- Routes -------------------------
 
-@api_router.get("/")
+@public_router.get("/")
 async def root():
     return {"service": "LICMAN", "status": "ok"}
+
+
+@public_router.get("/setup-status")
+async def setup_status():
+    count = await db.users.count_documents({})
+    return {"needs_setup": count == 0}
 
 
 @api_router.get("/servers", response_model=List[LicenseServer])
@@ -511,7 +851,7 @@ async def list_servers():
 
 
 @api_router.post("/servers", response_model=LicenseServer)
-async def create_server(payload: ServerCreate):
+async def create_server(payload: ServerCreate, _: dict = Depends(require_admin)):
     srv = LicenseServer(
         name=payload.name, vendor=payload.vendor, host=payload.host,
         port=payload.port, daemon=payload.daemon, status="up",
@@ -550,7 +890,7 @@ async def update_server(server_id: str, payload: ServerUpdate):
 
 
 @api_router.delete("/servers/{server_id}")
-async def delete_server(server_id: str):
+async def delete_server(server_id: str, _: dict = Depends(require_admin)):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0, "name": 1})
     if not doc:
         raise HTTPException(404, "Server not found")
@@ -676,7 +1016,7 @@ async def all_checkouts():
 # ---------- SSH config ----------
 
 @api_router.put("/servers/{server_id}/ssh", response_model=LicenseServer)
-async def save_ssh_config(server_id: str, payload: SshConfig):
+async def save_ssh_config(server_id: str, payload: SshConfig, _: dict = Depends(require_admin)):
     res = await db.servers.find_one_and_update(
         {"id": server_id}, {"$set": {"ssh": payload.model_dump()}},
         return_document=True, projection={"_id": 0}
@@ -693,7 +1033,7 @@ class AdapterPayload(BaseModel):
 
 
 @api_router.put("/servers/{server_id}/adapter")
-async def set_adapter(server_id: str, payload: AdapterPayload):
+async def set_adapter(server_id: str, payload: AdapterPayload, _: dict = Depends(require_admin)):
     res = await db.servers.find_one_and_update(
         {"id": server_id}, {"$set": {"adapter_mode": payload.adapter_mode}},
         return_document=True, projection={"_id": 0}
@@ -766,7 +1106,7 @@ async def get_settings():
 
 
 @api_router.put("/settings")
-async def put_settings(payload: AlertSettings):
+async def put_settings(payload: AlertSettings, _: dict = Depends(require_admin)):
     data = payload.model_dump()
     data["_key"] = "alerts"
     await db.settings.update_one({"_key": "alerts"}, {"$set": data}, upsert=True)
@@ -876,7 +1216,7 @@ async def stats():
 
 
 @api_router.post("/seed/reset")
-async def seed_reset():
+async def seed_reset(_: dict = Depends(require_admin)):
     await db.servers.delete_many({})
     await db.checkouts.delete_many({})
     await db.reservations.delete_many({})
@@ -886,15 +1226,30 @@ async def seed_reset():
     return {"ok": True}
 
 
+app.include_router(public_router)
 app.include_router(api_router)
+app.include_router(auth_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: in private-LAN deploys we serve via nginx proxy on the same origin,
+# so a wildcard is fine. If you split origins, set CORS_ORIGINS=https://your.host
+# (comma-separated). When credentials are used, '*' becomes a regex match.
+_origins_env = os.environ.get('CORS_ORIGINS', '*').strip()
+if _origins_env == "*":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in _origins_env.split(",") if o.strip()],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -905,6 +1260,10 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
 async def startup_event():
+    # Indexes for auth
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("id", unique=True)
+    await db.login_attempts.create_index("identifier")
     await seed_if_empty()
 
 

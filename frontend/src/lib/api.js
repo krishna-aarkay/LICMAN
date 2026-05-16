@@ -1,11 +1,47 @@
 import axios from "axios";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 export const API = `${BACKEND_URL}/api`;
 
-const http = axios.create({ baseURL: API });
+const http = axios.create({ baseURL: API, withCredentials: true });
+
+// Refresh-on-401 interceptor — transparent for the UI
+let _refreshing = null;
+http.interceptors.response.use(
+  (r) => r,
+  async (error) => {
+    const cfg = error.config;
+    const status = error.response?.status;
+    const url = cfg?.url || "";
+    if (status === 401 && !cfg._retry && !url.includes("/auth/")) {
+      cfg._retry = true;
+      try {
+        _refreshing = _refreshing || http.post("/auth/refresh");
+        await _refreshing;
+        return http(cfg);
+      } catch {
+        // fall through to error
+      } finally {
+        _refreshing = null;
+      }
+    }
+    return Promise.reject(error);
+  }
+);
 
 export const api = {
+  // auth
+  setupStatus: () => http.get("/setup-status").then((r) => r.data),
+  authSetup: (data) => http.post("/auth/setup", data).then((r) => r.data),
+  authLogin: (data) => http.post("/auth/login", data).then((r) => r.data),
+  authMe: () => http.get("/auth/me").then((r) => r.data),
+  authLogout: () => http.post("/auth/logout").then((r) => r.data),
+
+  // users
+  listUsers: () => http.get("/users").then((r) => r.data),
+  createUser: (data) => http.post("/users", data).then((r) => r.data),
+  updateUser: (id, data) => http.patch(`/users/${id}`, data).then((r) => r.data),
+  deleteUser: (id) => http.delete(`/users/${id}`).then((r) => r.data),
   // servers
   listServers: () => http.get("/servers").then((r) => r.data),
   getServer: (id) => http.get(`/servers/${id}`).then((r) => r.data),

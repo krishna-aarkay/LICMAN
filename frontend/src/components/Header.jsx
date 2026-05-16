@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
-import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard, LogOut, Users as UsersIcon, Shield, User as UserIcon } from "lucide-react";
+import { useAuth } from "@/contexts/AuthContext";
 
 export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
   const [time, setTime] = useState(new Date());
   const loc = useLocation();
+  const nav = useNavigate();
+  const { user, isAdmin, logout } = useAuth();
 
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 1000);
@@ -12,10 +15,16 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
   }, []);
 
   const navLinks = [
-    { to: "/", label: "CONTROL ROOM", icon: LayoutDashboard, test: "nav-dashboard" },
-    { to: "/expiry", label: "EXPIRY", icon: Calendar, test: "nav-expiry" },
-    { to: "/settings", label: "SETTINGS", icon: SettingsIcon, test: "nav-settings" },
-  ];
+    { to: "/", label: "CONTROL ROOM", icon: LayoutDashboard, test: "nav-dashboard", show: true },
+    { to: "/expiry", label: "EXPIRY", icon: Calendar, test: "nav-expiry", show: true },
+    { to: "/users", label: "USERS", icon: UsersIcon, test: "nav-users", show: isAdmin },
+    { to: "/settings", label: "SETTINGS", icon: SettingsIcon, test: "nav-settings", show: isAdmin },
+  ].filter((l) => l.show);
+
+  const onLogout = async () => {
+    await logout();
+    nav("/login");
+  };
 
   return (
     <header
@@ -74,6 +83,19 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
 
           {/* Actions */}
           <div className="flex items-center gap-2">
+            {user && (
+              <div className="hidden sm:flex items-center gap-2 px-2.5 py-1.5 border border-[#222] bg-[#0a0a0a]" data-testid="user-badge">
+                {isAdmin
+                  ? <Shield size={11} className="text-amber-400" />
+                  : <UserIcon size={11} className="text-emerald-400" />}
+                <span className="font-mono text-[10px] uppercase tracking-wider text-white truncate max-w-[180px]">
+                  {user.email}
+                </span>
+                <span className="font-mono text-[9px] uppercase tracking-wider text-[#6b7280]">
+                  {user.role}
+                </span>
+              </div>
+            )}
             <button
               onClick={onToggleRefresh}
               className={`btn-brutal flex items-center gap-2 ${autoRefresh ? "primary" : ""}`}
@@ -92,6 +114,16 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
               >
                 <RotateCw size={12} />
                 RESET
+              </button>
+            )}
+            {user && (
+              <button
+                onClick={onLogout}
+                className="btn-brutal flex items-center gap-2"
+                data-testid="logout-btn"
+                title="Sign out"
+              >
+                <LogOut size={12} /> LOGOUT
               </button>
             )}
           </div>

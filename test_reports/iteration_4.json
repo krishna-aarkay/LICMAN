@@ -1,0 +1,73 @@
+{
+  "summary": "Iteration 4 JWT auth testing: 25/27 backend auth tests passed. Frontend login/logout/RBAC nav/Users page/CONNECTION tab all verified working. Two real backend bugs found: (1) POST /api/settings/test-email missing require_admin guard — engineers can trigger SMTP test emails; (2) brute-force lockout broken behind k8s multi-replica ingress because identifier uses request.client.host which rotates across proxy IPs (10.219.1.134, 10.219.5.108 observed) so per-email failure count is split and never reaches threshold.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/settings/test-email",
+        "issue": "Missing Depends(require_admin). Engineer-role user successfully invokes endpoint (returns 400 'SMTP host not configured' instead of 403). Spec lists this as an admin-only endpoint.",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "POST /api/auth/login",
+        "issue": "Brute-force lockout never triggers behind k8s ingress. Identifier is f'{request.client.host}:{email}' but request.client.host is the ingress controller IP which rotates between multiple replicas (observed 10.219.1.134 and 10.219.5.108 alternating across 7 sequential login attempts). Each replica IP separately accumulates <5 failures and never hits LOCKOUT_THRESHOLD. Brute-force protection is effectively disabled in this deployment.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/auth/login",
+        "issue": "Lockout identifier may also be circumvented by attackers naturally — recommend keying by email-only (or email + normalised X-Forwarded-For first hop) and adding a per-account counter."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Dashboard server card click",
+        "issue": "Clicking the server-card-<id> element itself does not navigate; navigation only happens when the nested <a href=/servers/...> link is clicked directly. Not blocking (link works) but UX is inconsistent — entire card visually looks clickable.",
+        "affected_selectors": ["[data-testid^='server-card-']"]
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "SshConfigPanel (CONNECTION tab)",
+        "issues": ["No data-testid='ssh-config-panel' on the panel root — panel renders fine and individual fields are visible, but a top-level testid would help future automation."]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration4_auth.py",
+    "/app/test_reports/pytest/iteration4_auth.xml"
+  ],
+  "action_items": [
+    "FIX (HIGH): Add `_: dict = Depends(require_admin)` to POST /api/settings/test-email handler (server.py line ~1123).",
+    "FIX (HIGH): Brute-force identifier must not rely on request.client.host alone behind k8s ingress. Either (a) key by email-only, or (b) parse X-Forwarded-For/X-Real-IP first hop, or (c) maintain a separate per-account fail counter. Document the chosen mitigation.",
+    "MINOR: Add data-testid='ssh-config-panel' to root of SshConfigPanel for testability.",
+    "MINOR: Prior iteration test suites (test_iteration3.py, test_new_features.py) now 401 because auth is enforced — update them to login via the admin_session fixture, or accept those suites are superseded by test_iteration4_auth.py."
+  ],
+  "critical_code_review_comments": [
+    "POST /api/settings/test-email is missing require_admin guard — confirmed via live engineer-session call returning 400 instead of 403. Compare with PUT /api/settings which DOES have require_admin.",
+    "Brute-force protection uses request.client.host which is the ingress proxy IP behind k8s — practically ineffective. Mongo logs show alternating 10.219.x.x IPs for the same client browser/curl session.",
+    "_set_auth_cookies uses secure=False — fine for preview/HTTP but for production HTTPS this should be configurable via env (COOKIE_SECURE=true) otherwise the secure flag never gets set even on https deployments.",
+    "JWT_SECRET is read at every request via _jwt_secret() rather than cached at import time — minor perf nit but acceptable.",
+    "PATCH /api/users/{id} last-admin guard checks role==engineer OR active==False AND target.role==admin, but does NOT re-check after the update if multiple admins are being demoted in parallel. Race condition is theoretical but exists. Consider a transactional check or unique index trick.",
+    "server.py now ~1273 lines (exceeded 700 guideline again) — auth module should be split into /app/backend/auth.py with routers/dependencies/helpers.",
+    "auth_router is registered AFTER api_router/public_router include — works because prefix is /api/auth and api_router uses /api with auth dep, but /api/auth/setup must NOT require auth (it doesn't because it's on auth_router without dependencies). Ordering is fine but easy to break — recommend a comment."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration4_auth.py (new)",
+    "/app/test_reports/pytest/iteration4_auth.xml (new)",
+    "/app/test_reports/iteration_4.json (new)"
+  ],
+  "success_rate": {
+    "backend": "25/27 (92.6%) — 2 real backend bugs: test-email RBAC + brute-force ineffective behind ingress",
+    "frontend": "100% on tested flows — login redirect, valid/invalid login, admin nav links (USERS+SETTINGS+LOGOUT visible), user-badge shows email+role, Users page renders, CONNECTION tab + SshConfigPanel render correctly, logout clears auth"
+  },
+  "test_credentials": "admin@example.com / adminpass123 (provisioned, password_hash starts with $2b$12$ — bcrypt correct). Engineer users created on-the-fly via POST /api/users by admin_session fixture.",
+  "seed_data_creation": "Created ephemeral engineer user TEST_eng_<random>@example.com per test module for RBAC tests; deleted via fixture teardown.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Auth iteration 4 is mostly green. Two HIGH bugs to fix before next iteration: (1) require_admin on /api/settings/test-email, (2) brute-force lockout identifier must not depend on request.client.host alone (k8s ingress proxy IP rotates across pods 10.219.1.134 & 10.219.5.108). After fixes, re-run `pytest /app/backend/tests/test_iteration4_auth.py -v --junitxml=/app/test_reports/pytest/iteration4_auth.xml`. Public URL: https://eda-license-portal.preview.emergentagent.com. JWT_SECRET configured in backend/.env. DB_NAME=test_database. Admin already provisioned. Cookies httpOnly samesite=lax secure=False. Prior iteration test files now 401 by design (auth enforced) and should either be updated to authenticate or be removed in favour of new auth-aware tests.",
+  "rca_of_the_issue": "Bug 1 RCA: server.py:1122 @api_router.post('/settings/test-email') has no `_: dict = Depends(require_admin)` parameter, while sibling admin endpoints (PUT /settings, POST /seed/reset, POST /servers) do. Likely an oversight when iteration 4 added the role guards. Fix: add `, _: dict = Depends(require_admin)` to test_email() signature.\n\nBug 2 RCA: server.py:709 `ident = f\"{request.client.host if request.client else 'na'}:{email}\"`. Under k8s ingress with multiple controller replicas, request.client.host is the per-pod proxy IP which load-balances across pods. Mongo login_attempts collection showed alternating IPs (10.219.1.134, 10.219.5.108) for the same external client. _is_locked_out() filters by identifier exact match so each proxy-pod accumulates <5 entries. Mitigation: use email-only identifier (simplest), or parse X-Forwarded-For first hop, or add a separate per-account failure counter on the user document with TTL."
+}

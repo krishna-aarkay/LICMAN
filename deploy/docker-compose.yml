@@ -21,6 +21,7 @@ services:
       DB_NAME: ${MONGO_DB_NAME:-licman}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       DEMO_MODE: ${DEMO_MODE:-1}
+      JWT_SECRET: ${JWT_SECRET}
       TZ: ${TZ:-UTC}
     depends_on: [mongo]
     networks: [licman]
