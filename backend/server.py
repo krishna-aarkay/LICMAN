@@ -414,6 +414,130 @@ async def ssh_execute(server: dict, command: str) -> dict:
     return {"mode": "mock", "command": command, "output": f"[MOCK] {command} executed", "exit": 0}
 
 
+# ---------- lmstat output parser ----------
+
+# Parses standard FlexLM `lmstat -a` output produced by lmutil from any vendor.
+_RE_USERS_OF = re.compile(
+    r"^Users of\s+(?P<feature>\S+):\s+\(Total of (?P<total>\d+) license[s]? issued;"
+    r"\s+Total of (?P<inuse>\d+) license[s]? in use\)",
+    re.IGNORECASE,
+)
+_RE_FEATURE_META = re.compile(
+    r'^\s*"(?P<feature>[^"]+)"\s+v(?P<version>\S+),\s+vendor:\s*(?P<vendor>[A-Za-z0-9_.-]+)'
+    r'(?:,\s*expiry:\s*(?P<expires>\S+))?',
+    re.IGNORECASE,
+)
+# Example:  ramak edaserver1 :0.0 (v17.1) (hostname/5280 102), start Wed 5/14 9:42
+_RE_USER_LINE = re.compile(
+    r"^\s+(?P<user>\S+)\s+(?P<host>\S+)\s+(?P<display>\S+)\s+"
+    r"\(v?(?P<ver>[^)]+)\)\s+\((?P<lic>\S+)\s+(?P<pid>\d+)\),\s+start\s+(?P<when>.+)$"
+)
+_MONTH_NAMES = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+                "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+
+
+def _parse_start_to_iso(when: str) -> str:
+    """`Wed 5/14 9:42` or `5/14/2025 9:42` → ISO timestamp. Best-effort, falls back to now."""
+    s = when.strip()
+    now = datetime.now(timezone.utc)
+    try:
+        parts = s.split()
+        # Drop leading day name if present (Mon..Sun)
+        if parts and parts[0][:3].title() in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
+            parts = parts[1:]
+        if not parts:
+            return now.isoformat()
+        date_str = parts[0]
+        time_str = parts[1] if len(parts) > 1 else "0:00"
+        m, d, *y = date_str.split("/")
+        year = int(y[0]) if y else now.year
+        month, day = int(m), int(d)
+        hh, mm = (int(x) for x in time_str.split(":")[:2])
+        return datetime(year, month, day, hh, mm, 0, tzinfo=timezone.utc).isoformat()
+    except Exception:
+        return now.isoformat()
+
+
+def parse_lmstat_a(text: str, server_id: str) -> dict:
+    """Return dict {features: [...], checkouts: [...]} parsed from `lmstat -a` output."""
+    features: dict = {}
+    checkouts: list = []
+    current_feature = None
+
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
+        m = _RE_USERS_OF.match(line)
+        if m:
+            current_feature = m.group("feature")
+            features[current_feature] = {
+                "name": current_feature,
+                "total": int(m.group("total")),
+                "in_use": int(m.group("inuse")),
+                "version": "",
+                "expires": "permanent",
+            }
+            # Sometimes the meta line follows after a blank line
+            for j in range(i + 1, min(i + 4, len(lines))):
+                mm = _RE_FEATURE_META.match(lines[j])
+                if mm and mm.group("feature") == current_feature:
+                    features[current_feature]["version"] = mm.group("version")
+                    features[current_feature]["expires"] = mm.group("expires") or "permanent"
+                    break
+            continue
+        mu = _RE_USER_LINE.match(line)
+        if mu and current_feature:
+            checkouts.append({
+                "id": str(uuid.uuid4()),
+                "server_id": server_id,
+                "feature": current_feature,
+                "version": mu.group("ver"),
+                "user": mu.group("user"),
+                "host": mu.group("host"),
+                "display": mu.group("display"),
+                "pid": int(mu.group("pid")),
+                "checkout_time": _parse_start_to_iso(mu.group("when")),
+            })
+    return {
+        "features": [
+            {"name": f["name"], "version": f.get("version") or "1.0",
+             "total": f["total"], "expires": f.get("expires") or "permanent"}
+            for f in features.values()
+        ],
+        "checkouts": checkouts,
+    }
+
+
+async def _real_checkouts_via_ssh(server: dict) -> Optional[dict]:
+    """Returns {features, checkouts} parsed from real lmstat output, or None on failure."""
+    ssh = server.get("ssh", {}) or {}
+    if not (ssh.get("enabled") and PARAMIKO_AVAILABLE):
+        return None
+    lmutil = ssh.get("lmutil_path") or "lmutil"
+    cmd = f"{lmutil} lmstat -a -c {server['port']}@{server['host']}"
+    res = await asyncio.to_thread(_ssh_real_exec, ssh, cmd)
+    if res.get("exit") != 0 or not res.get("output"):
+        logger.warning(f"lmstat ssh failed on {server['name']}: {res.get('output')[:200]}")
+        return None
+    return parse_lmstat_a(res["output"], server["id"])
+
+
+async def gather_checkouts(server: dict) -> list:
+    """Return checkouts. Use real lmstat when adapter_mode='ssh', else simulate."""
+    mode = server.get("adapter_mode", "mock")
+    if mode == "ssh":
+        parsed = await _real_checkouts_via_ssh(server)
+        if parsed is not None:
+            # Persist parsed features if any new ones discovered
+            if parsed["features"]:
+                await db.servers.update_one(
+                    {"id": server["id"]}, {"$set": {"features": parsed["features"]}}
+                )
+            return parsed["checkouts"]
+        # SSH failed → fall back to empty (do NOT lie with simulated data)
+        return []
+    return generate_checkouts(server)
+
+
 
 def default_license_text(vendor: str, name: str, port: int, daemon: str):
     """Build a plausible-looking license file."""
@@ -1003,8 +1127,7 @@ async def server_checkouts(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc or doc.get("status") != "up":
         return []
-    # Regenerate simulated checkouts each call to feel live
-    fresh = generate_checkouts(doc)
+    fresh = await gather_checkouts(doc)
     await db.checkouts.delete_many({"server_id": server_id})
     if fresh:
         await db.checkouts.insert_many([{**c} for c in fresh])
@@ -1016,12 +1139,11 @@ async def all_checkouts():
     servers = await db.servers.find({"status": "up"}, {"_id": 0}).to_list(500)
     all_co = []
     for srv in servers:
-        fresh = generate_checkouts(srv)
+        fresh = await gather_checkouts(srv)
         all_co.extend(fresh)
     await db.checkouts.delete_many({})
     if all_co:
         await db.checkouts.insert_many([{**c} for c in all_co])
-    # Side-effect: evaluate alert conditions on each fetch (best-effort)
     try:
         await evaluate_alerts()
     except Exception as e:
@@ -1062,17 +1184,85 @@ async def set_adapter(server_id: str, payload: AdapterPayload, _: dict = Depends
 
 
 @api_router.post("/servers/{server_id}/ssh/test")
-async def test_ssh(server_id: str):
+async def test_ssh(server_id: str, _: dict = Depends(require_admin)):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
     ssh = doc.get("ssh", {}) or {}
-    # Mock: succeed only if host+user are filled
-    ok = bool(ssh.get("host") and ssh.get("username"))
-    msg = (f"[STUB] would connect to {ssh.get('username')}@{ssh.get('host')}:{ssh.get('port', 22)}"
-           if ok else "Missing host or username")
-    await log_audit("SSH_TEST", msg, server_id, doc["name"], "success" if ok else "error")
-    return {"ok": ok, "message": msg, "mocked": True}
+    if not (ssh.get("host") and ssh.get("username")):
+        return {"ok": False, "message": "Missing host or username", "mocked": True}
+    if ssh.get("enabled") and PARAMIKO_AVAILABLE:
+        res = await asyncio.to_thread(
+            _ssh_real_exec, ssh, f"echo licman-ok && which {ssh.get('lmutil_path','lmutil')} || true"
+        )
+        ok = res.get("exit") == 0
+        await log_audit("SSH_TEST", f"SSH test {ssh['username']}@{ssh['host']} -> {res.get('output')[:200]}",
+                        server_id, doc["name"], "success" if ok else "error")
+        return {"ok": ok, "message": res.get("output", "")[:500], "mocked": False, "exit": res.get("exit")}
+    msg = f"[STUB] would connect to {ssh.get('username')}@{ssh.get('host')}:{ssh.get('port', 22)}"
+    await log_audit("SSH_TEST", msg, server_id, doc["name"], "info")
+    return {"ok": True, "message": msg, "mocked": True}
+
+
+@api_router.post("/servers/{server_id}/sync")
+async def sync_server(server_id: str, _: dict = Depends(require_admin)):
+    """Run lmstat -a over SSH, parse, persist features + checkouts."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    if doc.get("adapter_mode") != "ssh":
+        raise HTTPException(400, "Sync requires adapter_mode='ssh' on this server")
+    parsed = await _real_checkouts_via_ssh(doc)
+    if parsed is None:
+        await log_audit("SYNC_FAIL", f"lmstat sync failed for {doc['name']}",
+                        server_id, doc["name"], "error")
+        raise HTTPException(502, "lmstat command failed — check SSH config and lmutil_path")
+    update = {}
+    if parsed["features"]:
+        update["features"] = parsed["features"]
+    update["last_action"] = f"lmstat sync @ {datetime.now(timezone.utc).isoformat()}"
+    await db.servers.update_one({"id": server_id}, {"$set": update})
+    await db.checkouts.delete_many({"server_id": server_id})
+    if parsed["checkouts"]:
+        await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+    await log_audit("SYNC_OK",
+                    f"Synced {doc['name']}: {len(parsed['features'])} features, {len(parsed['checkouts'])} checkouts",
+                    server_id, doc["name"], "success")
+    return {
+        "ok": True,
+        "features_parsed": len(parsed["features"]),
+        "checkouts_parsed": len(parsed["checkouts"]),
+    }
+
+
+@api_router.post("/servers/{server_id}/fetch-license")
+async def fetch_license(server_id: str, _: dict = Depends(require_admin)):
+    """Pull the actual .lic file from the license host over SSH (cat)."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    ssh = doc.get("ssh", {}) or {}
+    if doc.get("adapter_mode") != "ssh" or not ssh.get("enabled"):
+        raise HTTPException(400, "SSH adapter not enabled on this server")
+    lmutil = ssh.get("lmutil_path") or "lmutil"
+    discover_cmd = (
+        f"{lmutil} lmdiag -c {doc['port']}@{doc['host']} 2>/dev/null "
+        f"| grep -m1 -oE '/[^ ]+\\.(lic|dat)' || true"
+    )
+    disc = await asyncio.to_thread(_ssh_real_exec, ssh, discover_cmd)
+    lic_path = (disc.get("output") or "").strip().splitlines()[0] if disc.get("output") else ""
+    if not lic_path:
+        raise HTTPException(404, "Could not auto-discover license file path on remote host. "
+                                 "Pass ?path=/full/path/to/license.dat manually.")
+    res = await asyncio.to_thread(_ssh_real_exec, ssh, f"cat {lic_path}")
+    if res.get("exit") != 0 or not res.get("output"):
+        raise HTTPException(502, f"Failed to read remote license file: {res.get('output','')[:300]}")
+    content = res["output"]
+    await db.servers.update_one({"id": server_id}, {"$set": {"license_file": content}})
+    await log_audit("LICENSE_FETCH",
+                    f"Fetched license from {ssh.get('host')}:{lic_path} ({len(content)} bytes)",
+                    server_id, doc["name"], "success")
+    return {"ok": True, "path": lic_path, "bytes": len(content)}
 
 
 # ---------- Expiry ----------

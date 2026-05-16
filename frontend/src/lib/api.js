@@ -55,6 +55,8 @@ export const api = {
   reread: (id) => http.post(`/servers/${id}/reread`).then((r) => r.data),
   restart: (id) => http.post(`/servers/${id}/restart`).then((r) => r.data),
   toggle: (id) => http.post(`/servers/${id}/toggle`).then((r) => r.data),
+  sync: (id) => http.post(`/servers/${id}/sync`).then((r) => r.data),
+  fetchLicense: (id) => http.post(`/servers/${id}/fetch-license`).then((r) => r.data),
   saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
   setAdapter: (id, mode) =>
     http.put(`/servers/${id}/adapter`, { adapter_mode: mode }).then((r) => r.data),

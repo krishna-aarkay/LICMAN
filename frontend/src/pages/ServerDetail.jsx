@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
-import { ArrowLeft, FileText, Settings, ListChecks, Save, Plus, Trash2, RefreshCw, Power, Activity, Plug } from "lucide-react";
+import { ArrowLeft, FileText, Settings, ListChecks, Save, Plus, Trash2, RefreshCw, Power, Activity, Plug, Download, RotateCw } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api, vendorMeta, fmtAgo } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
 import { prefs } from "@/lib/prefs";
 import Header from "@/components/Header";
 import CodeEditor from "@/components/CodeEditor";
@@ -30,6 +31,7 @@ const daysUntil = (d) => (d ? Math.floor((d - new Date()) / 86400000) : null);
 
 export default function ServerDetail() {
   const { id } = useParams();
+  const { isAdmin } = useAuth();
   const [server, setServer] = useState(null);
   const [licText, setLicText] = useState("");
   const [optText, setOptText] = useState("");
@@ -194,6 +196,24 @@ export default function ServerDetail() {
             </div>
 
             <div className="flex flex-wrap gap-2">
+              {server.adapter_mode === "ssh" && isAdmin && (
+                <button
+                  className="btn-brutal flex items-center gap-1.5"
+                  onClick={async () => {
+                    try {
+                      const r = await api.sync(id);
+                      toast.success(`Synced · ${r.features_parsed} features · ${r.checkouts_parsed} checkouts`);
+                      load();
+                    } catch (e) {
+                      toast.error(e?.response?.data?.detail || "Sync failed");
+                    }
+                  }}
+                  data-testid="srv-sync"
+                  title="lmstat -a over SSH → parse features + checkouts"
+                >
+                  <RotateCw size={12} /> SYNC NOW
+                </button>
+              )}
               <button
                 className="btn-brutal flex items-center gap-1.5"
                 onClick={() => act(() => api.reread(id), "lmreread issued")}
@@ -326,6 +346,25 @@ export default function ServerDetail() {
               onSave={saveLicense}
               testId="license-panel"
               saveTestId="save-license-btn"
+              extraActions={server.adapter_mode === "ssh" && isAdmin ? (
+                <button
+                  className="btn-brutal flex items-center gap-1.5"
+                  onClick={async () => {
+                    try {
+                      const r = await api.fetchLicense(id);
+                      toast.success(`Fetched from ${r.path} (${r.bytes} bytes)`);
+                      setLicDirty(false);
+                      load();
+                    } catch (e) {
+                      toast.error(e?.response?.data?.detail || "Fetch failed");
+                    }
+                  }}
+                  data-testid="fetch-license-btn"
+                  title="cat the .lic file from the license host over SSH"
+                >
+                  <Download size={12} /> FETCH FROM SERVER
+                </button>
+              ) : null}
             >
               <CodeEditor
                 value={licText}
@@ -442,14 +481,15 @@ export default function ServerDetail() {
   );
 }
 
-const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint }) => (
+const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint, extraActions }) => (
   <div className="bg-[#111] border border-[#222] rounded-sm" data-testid={testId}>
-    <div className="px-4 py-3 border-b border-[#222] flex items-center justify-between">
+    <div className="px-4 py-3 border-b border-[#222] flex items-center justify-between flex-wrap gap-2">
       <div>
         <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">{title}</div>
         {hint && <div className="font-mono text-[10px] text-[#6b7280] mt-0.5">{hint}</div>}
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        {extraActions}
         {dirty && (
           <span className="font-mono text-[10px] text-[#f59e0b] uppercase tracking-wider" data-testid="editor-dirty-flag">
             ● UNSAVED
