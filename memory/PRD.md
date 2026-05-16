@@ -49,9 +49,23 @@ Follow-ups:
   - `licman.service` — systemd unit so the stack starts on boot
   - `README.md` — end-to-end install guide
 
+## Iteration 8 — UX polish + Usage telemetry — 2026-02
+- **UTC ↔ IST clock toggle** in header (default IST), persisted in `prefs.tz`. All timestamps in the new Usage page and CheckoutTable use the chosen timezone.
+- **Usage History page** (`/usage`) with:
+  - Date-range presets (TODAY / 7D / 30D / 90D / 1Y / ALL) + custom from/to inputs
+  - Filters: user (dropdown from `/api/usage/facets`), license/feature, vendor
+  - Aggregation by user / feature / vendor / server (toggle)
+  - Sortable column headers on the sessions table
+  - One-click CSV export honouring all active filters
+- **Backend tracking**: `usage_history` collection upserted on every sync tick (server-side scheduler + on-demand `/api/checkouts`). 365-day TTL (configurable via `USAGE_TTL_DAYS`). New endpoints: `GET /api/usage`, `/api/usage/export`, `/api/usage/summary`, `/api/usage/facets`.
+- **Kill checkout** from the web: `POST /api/servers/{id}/checkouts/kill` runs `lmutil lmremove -h <feature> <vendor_daemon> <host> <user>` over SSH (or mock). Admin-only. All four user-supplied identifiers are validated against `^[A-Za-z0-9._@:/+-]+$` and shlex-quoted to block shell injection.
+- **Feature drill-in**: ServerDetail feature boxes replaced with clickable rows. Clicking a row opens a Feature Detail modal listing active checkouts (with kill buttons) and reservations.
+- **Kill buttons** added to Dashboard CheckoutTable rows + ServerDetail Checkouts tab + Feature Detail modal (all admin-gated).
+- **Sortable column headers** on Dashboard CheckoutTable, Expiry table, and the new Usage detail/aggregate tables. Permanent expirations stay pinned at the bottom regardless of sort direction.
+
 ## Testing
-- Backend: **66/66 pytests** passing (iter4 auth 27 + iter6 hardening 18 + iter7 features 21)
-- Frontend: all critical flows verified by testing agent across iterations 5–7
+- Backend: **111/111 pytests** passing (iter4 + iter6 + iter7 + iter8 = 27+18+21+24+misc + injection test)
+- Frontend: **19/19 critical UI flows** verified across iterations 5–8
 
 ## Iteration 7 — "Add all the best" final feature batch — 2026-02
 - **Bulk operations**: `POST /api/servers/sync-all` and `POST /api/servers/reread-all` for one-click maintenance across the fleet (admin-only). Dashboard exposes new `SYNC ALL` and `REREAD ALL` buttons gated to admin.

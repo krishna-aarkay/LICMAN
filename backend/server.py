@@ -5,6 +5,7 @@ import io as _io
 import json as _json
 import urllib.request as _urlreq
 import urllib.error as _urlerr
+import shlex as _shlex
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -1338,13 +1339,32 @@ async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dic
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
+    # Validate every user-supplied identifier against a tight regex BEFORE composing
+    # the shell command — prevents injection via spaces, semicolons, backticks, $()
+    _SAFE = re.compile(r"^[A-Za-z0-9._@:/+\-]+$")
+    for label, value in (
+        ("feature", payload.feature),
+        ("user", payload.user),
+        ("host", payload.host),
+        ("vendor_daemon", payload.vendor_daemon or doc.get("daemon", "")),
+    ):
+        if not value or not _SAFE.match(value):
+            raise HTTPException(
+                400,
+                f"Invalid {label!r}: must match ^[A-Za-z0-9._@:/+-]+$ (got {value!r})",
+            )
     vendor_daemon = (payload.vendor_daemon or doc.get("daemon") or "").strip()
-    if not vendor_daemon:
-        raise HTTPException(400, "vendor_daemon is required (or set server.daemon)")
     lmutil = ((doc.get("ssh") or {}).get("lmutil_path") or "lmutil").strip()
     # FlexLM lmremove syntax with -h forces remove without confirmation:
     #   lmremove -h <feature> <vendor_daemon> <host> <user>
-    cmd = f"{lmutil} lmremove -h {payload.feature} {vendor_daemon} {payload.host} {payload.user}"
+    # All four fields are pre-validated above; quote defensively anyway.
+    cmd = (
+        f"{_shlex.quote(lmutil)} lmremove -h "
+        f"{_shlex.quote(payload.feature)} "
+        f"{_shlex.quote(vendor_daemon)} "
+        f"{_shlex.quote(payload.host)} "
+        f"{_shlex.quote(payload.user)}"
+    )
     exec_log = await ssh_execute(doc, cmd)
     ok = exec_log.get("exit") == 0 or exec_log.get("mode") == "mock"
     severity = "success" if ok else "error"
