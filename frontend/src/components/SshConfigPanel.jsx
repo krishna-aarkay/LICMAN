@@ -4,8 +4,7 @@ import { api } from "@/lib/api";
 import { toast } from "sonner";
 
 export const SshConfigPanel = ({ server, onChange }) => {
-  const [cfg, setCfg] = useState(server?.ssh || {});
-  const [mode, setMode] = useState(server?.adapter_mode || "mock");
+  const [cfg, setCfg] = useState(server?.ssh || {});  const [mode, setMode] = useState(server?.adapter_mode || "mock");
   const [dirty, setDirty] = useState(false);
   const [testing, setTesting] = useState(false);
 
@@ -46,7 +45,7 @@ export const SshConfigPanel = ({ server, onChange }) => {
   };
 
   return (
-    <div className="bg-[#111] border border-[#222] rounded-sm" data-testid="ssh-panel">
+    <div className="bg-[#111] border border-[#222] rounded-sm" data-testid="ssh-config-panel">
       <div className="px-4 py-3 border-b border-[#222] flex items-center justify-between flex-wrap gap-2">
         <div>
           <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">

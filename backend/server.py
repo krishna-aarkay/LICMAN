@@ -703,17 +703,33 @@ async def auth_setup(payload: SetupRequest, response: Response):
     return {"user": _user_public(user_doc), "access_token": access}
 
 
+def _client_ip(request: Request) -> str:
+    """Resolve the real client IP behind a reverse-proxy / k8s ingress."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = request.headers.get("x-real-ip", "")
+    if xri:
+        return xri.strip()
+    return request.client.host if request.client else "na"
+
+
 @auth_router.post("/login")
 async def auth_login(payload: LoginRequest, request: Request, response: Response):
     email = payload.email.lower()
-    ident = f"{request.client.host if request.client else 'na'}:{email}"
-    if await _is_locked_out(ident):
+    # Brute-force protection keys on email (and best-effort IP) so that k8s ingress
+    # proxy-IP rotation doesn't split the counter across replicas.
+    ident_email = f"email:{email}"
+    ident_ip = f"ip:{_client_ip(request)}:{email}"
+    if (await _is_locked_out(ident_email)) or (await _is_locked_out(ident_ip)):
         raise HTTPException(429, f"Too many failed attempts — locked for {LOCKOUT_MINUTES} minutes")
     user = await db.users.find_one({"email": email})
     if not user or not user.get("active", True) or not verify_password(payload.password, user.get("password_hash", "")):
-        await _record_failed_login(ident)
+        await _record_failed_login(ident_email)
+        await _record_failed_login(ident_ip)
         raise HTTPException(401, "Invalid credentials")
-    await _clear_failed_logins(ident)
+    await _clear_failed_logins(ident_email)
+    await _clear_failed_logins(ident_ip)
     access  = create_access_token(user)
     refresh = create_refresh_token(user)
     _set_auth_cookies(response, access, refresh)
@@ -1120,7 +1136,7 @@ async def put_settings(payload: AlertSettings, _: dict = Depends(require_admin))
 
 
 @api_router.post("/settings/test-email")
-async def test_email():
+async def test_email(_: dict = Depends(require_admin)):
     cfg = await get_alert_settings()
     if not cfg.get("smtp_host"):
         raise HTTPException(400, "SMTP host not configured")
