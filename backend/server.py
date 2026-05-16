@@ -685,10 +685,12 @@ def decrypt_secret(value: str) -> str:
         return value
     f = _fernet()
     if f is None:
+        logger.warning("FERNET_KEY missing — cannot decrypt secret; returning empty")
         return ""
     try:
         return f.decrypt(value[len(_ENC_PREFIX):].encode("utf-8")).decode("utf-8")
     except InvalidToken:
+        logger.warning("Fernet InvalidToken — FERNET_KEY likely changed since encryption")
         return ""
 
 
@@ -810,8 +812,12 @@ def create_refresh_token(user: dict) -> str:
     )
 
 
+def _cookie_secure_flag() -> bool:
+    return os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
+
+
 def _set_auth_cookies(response: Response, access: str, refresh: str):
-    common = dict(httponly=True, samesite="lax", secure=False, path="/")
+    common = dict(httponly=True, samesite="lax", secure=_cookie_secure_flag(), path="/")
     response.set_cookie("access_token",  access,  max_age=ACCESS_TOKEN_MINUTES * 60, **common)
     response.set_cookie("refresh_token", refresh, max_age=REFRESH_TOKEN_DAYS * 86400, **common)
 
@@ -969,9 +975,8 @@ async def auth_refresh(request: Request, response: Response):
     except pyjwt.InvalidTokenError:
         raise HTTPException(401, "Invalid refresh token")
     access = create_access_token(user)
-    secure = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
     response.set_cookie("access_token", access, max_age=ACCESS_TOKEN_MINUTES * 60,
-                        httponly=True, samesite="lax", secure=secure, path="/")
+                        httponly=True, samesite="lax", secure=_cookie_secure_flag(), path="/")
     return {"access_token": access, "user": _user_public(user)}
 
 
@@ -1644,16 +1649,21 @@ async def _periodic_sync_loop():
 @app.on_event("startup")
 async def startup_event():
     global _sync_task
-    # Indexes: auth
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("id", unique=True)
-    await db.login_attempts.create_index("identifier")
-    # Indexes: data
-    await db.servers.create_index("id", unique=True)
-    await db.servers.create_index("vendor")
-    await db.checkouts.create_index("server_id")
-    await db.reservations.create_index("server_id")
-    await db.alert_events.create_index([("timestamp", -1)])
+    # Indexes: auth (wrapped in try/except so old DBs with dup entries don't block startup)
+    for idx in [
+        (db.users, [("email", 1)], {"unique": True}),
+        (db.users, [("id", 1)], {"unique": True}),
+        (db.login_attempts, [("identifier", 1)], {}),
+        (db.servers, [("id", 1)], {"unique": True}),
+        (db.servers, [("vendor", 1)], {}),
+        (db.checkouts, [("server_id", 1)], {}),
+        (db.reservations, [("server_id", 1)], {}),
+        (db.alert_events, [("timestamp", -1)], {}),
+    ]:
+        try:
+            await idx[0].create_index(idx[1], **idx[2])
+        except Exception as e:
+            logger.warning(f"index create skipped on {idx[0].name}: {e}")
     # Audit TTL — auto-delete entries older than AUDIT_TTL_DAYS (default 90 days)
     ttl_days = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
     try:
