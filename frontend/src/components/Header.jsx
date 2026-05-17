@@ -56,7 +56,7 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
                 LICMAN<span className="text-emerald-400 cursor-blink"></span>
               </div>
               <div className="font-mono text-[10px] text-[#6b7280] uppercase tracking-[0.25em]">
-                VLSI · LICENSE CONSOLE · v0.2
+                MOSCHIP · LICENSE CONSOLE
               </div>
             </div>
           </Link>

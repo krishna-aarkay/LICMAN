@@ -510,7 +510,13 @@ _MONTH_NAMES = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
 
 
 def _parse_start_to_iso(when: str) -> str:
-    """`Wed 5/14 9:42` or `5/14/2025 9:42` → ISO timestamp. Best-effort, falls back to now."""
+    """`Wed 5/14 9:42` or `5/14/2025 9:42` → ISO timestamp.
+    lmstat reports times in the LICENSE SERVER's LOCAL timezone (not UTC). We
+    therefore interpret the parsed components as local time using the backend
+    host's timezone (which is typically the same as the license server's TZ
+    on a private LAN), then convert to UTC for storage. Falls back to now on
+    any parsing error.
+    """
     s = when.strip()
     now = datetime.now(timezone.utc)
     try:
@@ -523,10 +529,17 @@ def _parse_start_to_iso(when: str) -> str:
         date_str = parts[0]
         time_str = parts[1] if len(parts) > 1 else "0:00"
         m, d, *y = date_str.split("/")
-        year = int(y[0]) if y else now.year
+        local_now = datetime.now().astimezone()
+        local_tz = local_now.tzinfo
+        year = int(y[0]) if y else local_now.year
         month, day = int(m), int(d)
         hh, mm = (int(x) for x in time_str.split(":")[:2])
-        return datetime(year, month, day, hh, mm, 0, tzinfo=timezone.utc).isoformat()
+        local_dt = datetime(year, month, day, hh, mm, 0, tzinfo=local_tz)
+        # If lmstat omitted the year and our guess lands in the future
+        # (e.g., logs from late December seen in early January), roll back.
+        if not y and local_dt > local_now + timedelta(days=1):
+            local_dt = local_dt.replace(year=year - 1)
+        return local_dt.astimezone(timezone.utc).isoformat()
     except Exception:
         return now.isoformat()
 

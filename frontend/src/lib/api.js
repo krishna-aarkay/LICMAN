@@ -165,6 +165,8 @@ export const KNOWN_VENDORS = Object.keys(VENDOR_PRESETS);
 export const fmtAgo = (iso) => {
   if (!iso) return "—";
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  // Clamp clock-skew / TZ mismatches so we never show a negative "ago"
+  if (diff < 0) return "just now";
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
