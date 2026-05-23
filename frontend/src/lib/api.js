@@ -131,6 +131,8 @@ export const api = {
   saveSettings: (data) => http.put(`/settings`, data).then((r) => r.data),
   testEmail: () => http.post(`/settings/test-email`).then((r) => r.data),
   testWebhook: () => http.post(`/settings/test-webhook`).then((r) => r.data),
+  preemptAutoStatus: () => http.get(`/preempt/auto-status`).then((r) => r.data),
+  preemptAutoTick: () => http.post(`/preempt/auto-tick`).then((r) => r.data),
   listAlerts: (limit = 50) =>
     http.get(`/alerts`, { params: { limit } }).then((r) => r.data),
   evaluateAlerts: () => http.post(`/alerts/evaluate`).then((r) => r.data),

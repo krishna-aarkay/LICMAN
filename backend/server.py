@@ -166,6 +166,9 @@ class AlertSettings(BaseModel):
     sge_enabled: bool = False
     sge_qstat_path: str = "qstat"
     sge_qmod_path: str = "qmod"
+    # Fully automatic background preemption loop
+    auto_preempt_enabled: bool = False
+    auto_preempt_interval_sec: int = 30
 
 
 class AlertEvent(BaseModel):
@@ -2796,9 +2799,8 @@ async def seed_reset(_: dict = Depends(require_admin)):
     return {"ok": True, "message": "Transient history cleared — user servers preserved"}
 
 
-app.include_router(public_router)
-app.include_router(api_router)
-app.include_router(auth_router)
+# (Routers are included near the bottom, after the auto-preempt scheduler is
+#  defined, so newly-added @api_router decorated endpoints are picked up.)
 
 # CORS: in private-LAN deploys we serve via nginx proxy on the same origin,
 # so a wildcard is fine. If you split origins, set CORS_ORIGINS=https://your.host
@@ -2869,7 +2871,287 @@ async def _periodic_sync_loop():
         await asyncio.sleep(interval)
 
 
+# ---------- Auto-preemption background loop ----------
+
+_preempt_task: Optional[asyncio.Task] = None
+
+
+async def _sge_get_pending_license_requests() -> List[dict]:
+    """Query SGE for jobs in `qw` (queued waiting) state, parse their hard
+    resource_list to extract requested license features. Returns one entry per
+    (job, feature) pair.
+
+    Expected resource format from `qsub -l <feature>=<count>`:
+        hard resource_list: innovus=1,calibre=2
+    """
+    cfg = await get_alert_settings()
+    if not cfg.get("sge_enabled"):
+        return []
+    qstat = (cfg.get("sge_qstat_path") or "qstat").strip()
+    # Pull pending jobs in XML for stable parsing (every SGE flavour supports -xml)
+    cmd_list = f"{_shlex.quote(qstat)} -s p -u '*' -xml 2>/dev/null || true"
+    try:
+        out = await _sge_run(cmd_list)
+    except HTTPException:
+        return []
+    raw = out.get("output") or ""
+    if not raw.strip():
+        return []
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        # qstat -xml not supported on some old SGE forks. Fall back to plain.
+        return await _sge_get_pending_legacy()
+    requests: List[dict] = []
+    for job in root.iter("job_list"):
+        jid = (job.findtext("JB_job_number") or "").strip()
+        user = (job.findtext("JB_owner") or "").strip()
+        project = (job.findtext("JB_project") or "").strip()
+        if not jid or not user:
+            continue
+        # Fetch hard resources for this job
+        det_cmd = (
+            f"{_shlex.quote(qstat)} -j {_shlex.quote(jid)} 2>/dev/null "
+            f"| awk -F: '/^hard resource_list/ {{sub(/^[^:]*:[[:space:]]*/, \"\"); print; exit}}'"
+        )
+        try:
+            det = await _sge_run(det_cmd)
+        except HTTPException:
+            continue
+        line = (det.get("output") or "").strip()
+        if not line:
+            continue
+        # Parse "feat1=1,feat2=2"
+        for part in line.split(","):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            feat, seats_s = part.split("=", 1)
+            feat = feat.strip()
+            try:
+                seats = max(1, int(seats_s.strip()))
+            except Exception:
+                seats = 1
+            if not feat:
+                continue
+            requests.append({
+                "jobid": jid, "user": user, "project": project,
+                "feature": feat, "seats": seats,
+            })
+    return requests
+
+
+async def _sge_get_pending_legacy() -> List[dict]:
+    """Fallback parser for SGE forks that don't speak XML. Best-effort."""
+    cfg = await get_alert_settings()
+    qstat = (cfg.get("sge_qstat_path") or "qstat").strip()
+    out = await _sge_run(
+        f"{_shlex.quote(qstat)} -s p -u '*' 2>/dev/null | awk 'NR>2 {{print $1\"|\"$4}}'"
+    )
+    pairs = [
+        ln.split("|", 1) for ln in (out.get("output") or "").splitlines()
+        if "|" in ln and ln.strip()
+    ]
+    requests: List[dict] = []
+    for jid, user in pairs:
+        det = await _sge_run(
+            f"{_shlex.quote(qstat)} -j {_shlex.quote(jid)} 2>/dev/null "
+            f"| awk -F: '/^hard resource_list/ {{sub(/^[^:]*:[[:space:]]*/, \"\"); print; exit}}'"
+        )
+        line = (det.get("output") or "").strip()
+        if not line:
+            continue
+        for part in line.split(","):
+            if "=" not in part:
+                continue
+            feat, seats_s = part.split("=", 1)
+            try:
+                seats = max(1, int(seats_s.strip()))
+            except Exception:
+                seats = 1
+            requests.append({
+                "jobid": jid.strip(), "user": user.strip(), "project": "",
+                "feature": feat.strip(), "seats": seats,
+            })
+    return requests
+
+
+async def _find_server_for_feature(feature: str) -> Optional[dict]:
+    """Locate the server whose features include this name (case-insensitive)."""
+    cur = db.servers.find({"status": "up"}, {"_id": 0})
+    async for s in cur:
+        for f in s.get("features") or []:
+            if (f.get("name") or "").lower() == feature.lower():
+                return s
+    return None
+
+
+async def _heuristic_preempt_candidates() -> List[dict]:
+    """SGE-free fallback. Treat every active priority rule as an implicit
+    'this user/group wants these features' request. If a matching feature is
+    saturated AND no current holder matches the rule, we synthesize a request.
+    This lets the loop work even before SGE is configured."""
+    rules = await db.priority_rules.find(
+        {"enabled": True}, {"_id": 0}
+    ).sort("priority", -1).to_list(500)
+    out: List[dict] = []
+    seen: set = set()
+    for r in rules:
+        feats = r.get("features") or []
+        if not feats:
+            continue
+        for fname in feats:
+            srv = await _find_server_for_feature(fname)
+            if not srv:
+                continue
+            feat = next((f for f in srv["features"] if f["name"] == fname), None)
+            if not feat:
+                continue
+            holders = await db.checkouts.find(
+                {"server_id": srv["id"], "feature": fname}, {"_id": 0}
+            ).to_list(500)
+            used = sum(int(h.get("count") or 1) for h in holders)
+            if used < int(feat.get("total") or 0):
+                continue  # Free seats — no preemption needed
+            # The rule's pattern is a glob — try to materialize it to a literal
+            # username only if it doesn't contain wildcards (`*?`); otherwise
+            # we can't preempt for an unknown user.
+            pat = (r.get("user_pattern") or "").strip()
+            if not pat or any(ch in pat for ch in "*?["):
+                continue
+            # Already has a checkout? Skip — they're satisfied.
+            if any(h.get("user", "").lower() == pat.lower() for h in holders):
+                continue
+            key = (srv["id"], fname, pat)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "jobid": f"rule:{r['id']}",
+                "user": pat,
+                "project": "",
+                "feature": fname,
+                "seats": 1,
+            })
+    return out
+
+
+async def _auto_preempt_tick() -> dict:
+    """One iteration of the auto-preemption loop. Returns a summary dict so the
+    on-demand admin endpoint can show what just happened.
+    """
+    cfg = await get_alert_settings()
+    # Pull pending requests — SGE first (real signal), heuristic fallback
+    requests: List[dict] = []
+    if cfg.get("sge_enabled"):
+        try:
+            requests = await _sge_get_pending_license_requests()
+        except Exception as e:
+            logger.warning(f"auto-preempt: SGE query failed: {e}")
+    if not requests:
+        requests = await _heuristic_preempt_candidates()
+    if not requests:
+        return {"scanned": 0, "actioned": 0, "results": []}
+
+    actioned = 0
+    results: List[dict] = []
+    fake_admin = {"role": "admin", "email": "auto-preempt@licman"}
+    for req in requests:
+        srv = await _find_server_for_feature(req["feature"])
+        if not srv:
+            results.append({**req, "outcome": "no_server"})
+            continue
+        # Skip if the user already holds a seat (avoid runaway loops)
+        existing = await db.checkouts.find_one({
+            "server_id": srv["id"], "feature": req["feature"], "user": req["user"],
+        })
+        if existing:
+            results.append({**req, "outcome": "user_already_holds"})
+            continue
+        payload = RequestLicensePayload(
+            server_id=srv["id"], feature=req["feature"],
+            requester_user=req["user"], requester_project=req.get("project", ""),
+            seats_needed=req["seats"],
+        )
+        try:
+            res = await request_license(payload, fake_admin)  # type: ignore
+            outcome = res.get("action") or "unknown"
+            if outcome == "preempted":
+                actioned += 1
+                await log_audit(
+                    "AUTO_PREEMPT",
+                    f"Auto-released seat for '{req['user']}' on '{req['feature']}' "
+                    f"(SGE jobid={req['jobid']}, server={srv['name']}, "
+                    f"seats_freed={res.get('seats_freed')})",
+                    srv["id"], srv["name"], "warning",
+                )
+            results.append({**req, "outcome": outcome,
+                            "seats_freed": res.get("seats_freed")})
+        except HTTPException as e:
+            results.append({**req, "outcome": f"error: {e.detail}"})
+        except Exception as e:
+            results.append({**req, "outcome": f"error: {str(e)[:120]}"})
+    return {"scanned": len(requests), "actioned": actioned, "results": results}
+
+
+async def _auto_preempt_loop():
+    """Daemon: tick every AUTO_PREEMPT_INTERVAL_SECONDS, no-op when disabled."""
+    interval_env = int(os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30"))
+    if interval_env <= 0:
+        logger.info("Auto-preempt loop disabled (AUTO_PREEMPT_INTERVAL_SECONDS=0)")
+        return
+    logger.info(f"Auto-preempt loop started — interval {interval_env}s")
+    while True:
+        try:
+            cfg = await get_alert_settings()
+            if cfg.get("auto_preempt_enabled"):
+                summary = await _auto_preempt_tick()
+                if summary["actioned"]:
+                    logger.info(
+                        f"auto-preempt: actioned {summary['actioned']} of "
+                        f"{summary['scanned']} request(s)"
+                    )
+        except Exception as e:
+            logger.warning(f"auto-preempt loop error: {e}")
+        # Settings can override env-derived interval at runtime
+        cfg = await get_alert_settings()
+        rt_interval = int(cfg.get("auto_preempt_interval_sec") or interval_env)
+        await asyncio.sleep(max(10, rt_interval))
+
+
+@api_router.post("/preempt/auto-tick")
+async def preempt_auto_tick_now(_: dict = Depends(require_admin)):
+    """Trigger one auto-preempt iteration on demand. Useful for testing without
+    waiting for the next scheduled tick."""
+    summary = await _auto_preempt_tick()
+    return summary
+
+
+@api_router.get("/preempt/auto-status")
+async def preempt_auto_status():
+    """Report whether the loop is running + last run summary."""
+    cfg = await get_alert_settings()
+    running = bool(_preempt_task and not _preempt_task.done())
+    return {
+        "running": running,
+        "enabled_in_settings": bool(cfg.get("auto_preempt_enabled")),
+        "interval_sec": int(cfg.get("auto_preempt_interval_sec") or
+                            os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30")),
+        "sge_enabled": bool(cfg.get("sge_enabled")),
+        "mode": "sge+heuristic" if cfg.get("sge_enabled") else "heuristic-only",
+    }
+
+
+# ---------- end auto-preempt scheduler ----------
 # ---------- end scheduler ----------
+
+
+# Register routers AFTER all @api_router decorators are defined, otherwise
+# FastAPI snapshots the route list at include time and misses later additions.
+app.include_router(public_router)
+app.include_router(api_router)
+app.include_router(auth_router)
 
 
 @app.on_event("startup")
@@ -2915,15 +3197,20 @@ async def startup_event():
     # Start auto-sync loop
     if os.environ.get("SYNC_INTERVAL_SECONDS", "60") != "0":
         _sync_task = asyncio.create_task(_periodic_sync_loop())
+    # Start auto-preempt loop (no-op until enabled in Settings)
+    global _preempt_task
+    if os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30") != "0":
+        _preempt_task = asyncio.create_task(_auto_preempt_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    global _sync_task
-    if _sync_task and not _sync_task.done():
-        _sync_task.cancel()
-        try:
-            await _sync_task
-        except (asyncio.CancelledError, Exception):
-            pass
+    global _sync_task, _preempt_task
+    for t in (_sync_task, _preempt_task):
+        if t and not t.done():
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
     client.close()
