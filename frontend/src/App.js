@@ -11,6 +11,7 @@ import Login from "@/pages/Login";
 import Setup from "@/pages/Setup";
 import Users from "@/pages/Users";
 import Usage from "@/pages/Usage";
+import Priority from "@/pages/Priority";
 
 function App() {
   return (
@@ -24,6 +25,7 @@ function App() {
             <Route path="/servers/:id" element={<ProtectedRoute><ServerDetail /></ProtectedRoute>} />
             <Route path="/expiry" element={<ProtectedRoute><Expiry /></ProtectedRoute>} />
             <Route path="/usage" element={<ProtectedRoute><Usage /></ProtectedRoute>} />
+            <Route path="/priority" element={<ProtectedRoute adminOnly><Priority /></ProtectedRoute>} />
             <Route path="/settings" element={<ProtectedRoute adminOnly><Settings /></ProtectedRoute>} />
             <Route path="/users" element={<ProtectedRoute adminOnly><Users /></ProtectedRoute>} />
           </Routes>

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard, LogOut, Users as UsersIcon, Shield, User as UserIcon, BarChart3, Globe } from "lucide-react";
+import { Activity, RotateCw, Terminal, Calendar, Settings as SettingsIcon, LayoutDashboard, LogOut, Users as UsersIcon, Shield, User as UserIcon, BarChart3, Globe, Crown } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { fmtClock } from "@/lib/api";
 import { prefs } from "@/lib/prefs";
@@ -28,6 +28,7 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
   const navLinks = [
     { to: "/", label: "CONTROL ROOM", icon: LayoutDashboard, test: "nav-dashboard", show: true },
     { to: "/usage", label: "USAGE", icon: BarChart3, test: "nav-usage", show: true },
+    { to: "/priority", label: "PRIORITY", icon: Crown, test: "nav-priority", show: isAdmin },
     { to: "/expiry", label: "EXPIRY", icon: Calendar, test: "nav-expiry", show: true },
     { to: "/users", label: "USERS", icon: UsersIcon, test: "nav-users", show: isAdmin },
     { to: "/settings", label: "SETTINGS", icon: SettingsIcon, test: "nav-settings", show: isAdmin },
@@ -123,15 +124,15 @@ export const Header = ({ stats, autoRefresh, onToggleRefresh, onReset }) => {
               <Activity size={12} />
               {autoRefresh ? "LIVE" : "PAUSED"}
             </button>
-            {loc.pathname === "/" && onReset && (
+            {loc.pathname === "/" && onReset && isAdmin && (
               <button
                 onClick={onReset}
                 className="btn-brutal flex items-center gap-2"
-                data-testid="reset-seed-btn"
-                title="Reset demo data"
+                data-testid="clear-history-btn"
+                title="Clear transient history (checkouts, alerts, audit, usage). Your servers and SSH credentials are preserved."
               >
                 <RotateCw size={12} />
-                RESET
+                CLEAR HIST
               </button>
             )}
             {user && (

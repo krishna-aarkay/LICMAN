@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Save, Send, Mail, BellRing, Info, Webhook, Download } from "lucide-react";
+import { Save, Send, Mail, BellRing, Info, Webhook, Download, Crown } from "lucide-react";
 import { api, fmtAgo } from "@/lib/api";
 import Header from "@/components/Header";
 import { toast } from "sonner";
@@ -318,6 +318,46 @@ export default function Settings() {
                   onChange={(v) => upd({ webhook_enabled: v })}
                   testid="webhook-enabled"
                   wrapperTestid="webhook-enabled-toggle"
+                />
+              </div>
+            </Panel>
+
+            <Panel title="SON OF GRID ENGINE (SGE)" icon={Crown}>
+              <div className="mb-3 flex items-start gap-2 text-[10px] font-mono text-[#9ca3af]">
+                <Info size={12} className="mt-0.5 shrink-0" />
+                <div>
+                  When SGE is enabled, the Priority &amp; Preemption page will try{" "}
+                  <span className="text-emerald-400">qmod -d &lt;jobid&gt;</span> first
+                  (graceful — kills the user&apos;s scheduled job) before falling back to
+                  <span className="text-amber-400"> lmremove </span>
+                  (force-yank the license seat). Both binaries are looked up on the LICENSE host over the same SSH connection used for lmstat.
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <Field label="qstat path">
+                  <input
+                    value={cfg.sge_qstat_path || ""}
+                    onChange={(e) => upd({ sge_qstat_path: e.target.value })}
+                    placeholder="qstat"
+                    className="inp"
+                    data-testid="sge-qstat-path"
+                  />
+                </Field>
+                <Field label="qmod path">
+                  <input
+                    value={cfg.sge_qmod_path || ""}
+                    onChange={(e) => upd({ sge_qmod_path: e.target.value })}
+                    placeholder="qmod"
+                    className="inp"
+                    data-testid="sge-qmod-path"
+                  />
+                </Field>
+                <Toggle
+                  label="SGE Integration Enabled"
+                  value={cfg.sge_enabled}
+                  onChange={(v) => upd({ sge_enabled: v })}
+                  testid="sge-enabled"
+                  wrapperTestid="sge-enabled-toggle"
                 />
               </div>
             </Panel>

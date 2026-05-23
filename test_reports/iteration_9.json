@@ -1,0 +1,41 @@
+{
+  "summary": "Iteration 9 — Verified 4 bug fixes (seed/reset preserves servers, lmreread command syntax, lmremove command syntax, ssh.test+fetch-license no decrypt crash) AND new Priority/Preemption feature suite (CRUD + role gating + plan/run/who-am-i + SGE settings). Backend: 16/16 iteration-9 tests PASS + 24/24 iteration-8 regression PASS = 40/40 (100%). Frontend: All 6 critical UI flows verified on live preview URL — Header label 'CLEAR HIST' with confirm dialog, nav-priority visible (admin), /priority page with priority-rules-table + add-priority-rule-btn + priority-editor + rule-save populating a new row, preempt-tester with server/feature/user inputs + preempt-plan-btn rendering preempt-plan-result + preempt-run-btn correctly disabled before plan, Settings SGE panel with sge-enabled-toggle/sge-qstat-path/sge-qmod-path + persistence across reload. Verified via direct exec.command parsing: lmreread emits 'lmutil lmreread -c <port>@<host> -vendor <daemon>' (NO stray @), lmremove emits 'lmutil lmremove -c <port>@<host> <feature> <user> <host> <display>' in correct order, injection {feature:'X;rm -rf /'} → 400. PREEMPT audit entry observed after preempt/run. Engineer role gets 403 on POST/PATCH/DELETE of /api/priority-rules.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration9.py",
+    "/app/test_reports/pytest/iteration9.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 2559 lines (was 2242 in iter8, +317 lines for priority/preempt code). Still well over the 700-line guideline. Suggest splitting preemption logic into /app/backend/preempt.py and priority CRUD into /app/backend/priority.py.",
+    "preempt_run() at server.py:2317 calls kill_checkout() which is itself an endpoint decorated with require_admin. Re-entering an endpoint from another endpoint is brittle (couples request lifecycle, dependency injection). Extract the core 'execute lmremove' logic into a private helper `_run_lmremove(srv, feature, user, host, display)` and have both kill_checkout and preempt_run call it.",
+    "_resolve_priority() runs an unbounded `db.priority_rules.find()` and walks 4 pattern matches per holder — O(rules × holders). For a 1000-rule, 500-checkout server this is 500k fnmatch calls per preempt/plan. Acceptable today but cache the rules list per request.",
+    "PriorityRule.priority allows 0–1000 (Field ge=0 le=1000) but releasable_holders is computed as 'strictly lower than requester' — a holder with prio 0 (no rule) is NOT releasable by a requester with prio 0. This is consistent with spec but worth documenting in the editor UI to avoid confusion (admin might set rule prio=0 thinking it's the floor).",
+    "SGE qstat/qmod paths are not validated (no shlex.quote in _sge_kill_job is fine since we do shlex.quote, but path is not checked to be absolute or to exist). On a real deployment a typo'd path will produce a generic timeout error that's hard to debug — add a /api/settings/sge/test endpoint.",
+    "/api/preempt/plan is NOT gated by require_admin (only /run is). Anyone authenticated can enumerate holder priorities + see who is checked out — minor info-leak. Consider gating with require_admin since the page itself is admin-only.",
+    "seed_reset (server.py:2407) has a dead `return {'ok': True}` on line 2425 after the prior return — unreachable code, lint warning."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration9.py (new — 16 tests across 6 classes)",
+    "/app/test_reports/pytest/iteration9.xml (new)",
+    "/app/test_reports/iteration_9.json (new)"
+  ],
+  "success_rate": {
+    "backend": "40/40 (100%) — 16 iteration-9 new + 24 iteration-8 regression",
+    "frontend": "6/6 critical flows verified — clear-history-btn label+confirm, nav-priority+routing, priority-rules-table+add-rule+editor+save, preempt-tester plan+disabled-run-btn, SGE panel render+persistence"
+  },
+  "test_credentials": "admin@example.com / adminpass123. Engineer-role test user TEST_eng_<uuid>@example.com created per-run for 403 tests (left in DB; idempotent).",
+  "seed_data_creation": "Per-run priority rule TEST_rakella_high (cleaned up via fixture teardown). One per-run UI rule 'UI_TEST_<ts>' (cleaned up via UI delete at end of Playwright test). SGE settings left at /opt/uitest/qstat-<ts> — harmless since sge_enabled is back to False.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All iteration-9 features GREEN. Reusable harness at /app/backend/tests/test_iteration9.py uses requests.Session cookie auth. UI testids confirmed: clear-history-btn, nav-priority, priority-rules-table, add-priority-rule-btn, priority-editor, rule-name, rule-priority, rule-user, rule-save, rule-cancel, priority-row-{id}, edit-priority-{id}, delete-priority-{id}, preempt-tester, preempt-server, preempt-feature, preempt-user, preempt-group, preempt-project, preempt-seats, preempt-plan-btn, preempt-plan-result, preempt-run-btn, preempt-run-result, sge-enabled-toggle, sge-qstat-path, sge-qmod-path. NOTE: page.fill() does NOT reliably trigger React onChange for controlled inputs in this app — use page.click(triple)+page.keyboard.delete+page.type(value, delay=20) for inputs guarded by a dirty flag (Settings SAVE). Code-review focus items: split server.py, extract _run_lmremove helper, cache priority rules, gate /api/preempt/plan with require_admin, remove dead code in seed_reset.",
+  "rca_of_the_issue": "N/A — no production bugs found. One test-harness flake on first frontend pass (page.fill not triggering dirty flag) was a Playwright/React interaction quirk, resolved by switching to page.type() with delay. Confirmed SGE persistence works end-to-end."
+}

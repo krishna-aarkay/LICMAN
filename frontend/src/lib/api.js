@@ -95,7 +95,16 @@ export const api = {
   audit: (limit = 50) =>
     http.get(`/audit`, { params: { limit } }).then((r) => r.data),
   stats: () => http.get(`/stats`).then((r) => r.data),
-  resetSeed: () => http.post(`/seed/reset`).then((r) => r.data),
+  clearHistory: () => http.post(`/seed/reset`).then((r) => r.data),
+
+  // priority rules / preemption (SGE-aware)
+  listPriorityRules: () => http.get(`/priority-rules`).then((r) => r.data),
+  createPriorityRule: (data) => http.post(`/priority-rules`, data).then((r) => r.data),
+  updatePriorityRule: (id, data) => http.patch(`/priority-rules/${id}`, data).then((r) => r.data),
+  deletePriorityRule: (id) => http.delete(`/priority-rules/${id}`).then((r) => r.data),
+  preemptPlan: (data) => http.post(`/preempt/plan`, data).then((r) => r.data),
+  preemptRun: (data) => http.post(`/preempt/run`, data).then((r) => r.data),
+  whoAmI: (params) => http.get(`/preempt/who-am-i`, { params }).then((r) => r.data),
 
   // expiry / settings / alerts
   expiry: (warn_days = 90) =>

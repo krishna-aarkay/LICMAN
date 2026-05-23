@@ -155,6 +155,10 @@ class AlertSettings(BaseModel):
     webhook_url: str = ""
     webhook_kind: Literal["slack", "teams", "generic", ""] = ""
     webhook_enabled: bool = False
+    # Son of Grid Engine integration for graceful preemption
+    sge_enabled: bool = False
+    sge_qstat_path: str = "qstat"
+    sge_qmod_path: str = "qmod"
 
 
 class AlertEvent(BaseModel):
@@ -1310,14 +1314,23 @@ async def reread(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
-    exec_log = await ssh_execute(doc, f"lmreread -c @{doc['port']}@{doc['host']}")
+    # Correct lmutil syntax:  lmutil lmreread -c <port>@<host> [-vendor <daemon>]
+    lmutil = ((doc.get("ssh") or {}).get("lmutil_path") or "lmutil").strip()
+    target = f"{doc['port']}@{doc['host']}"
+    daemon = (doc.get("daemon") or "").strip()
+    cmd = f"{_shlex.quote(lmutil)} lmreread -c {_shlex.quote(target)}"
+    if daemon:
+        cmd += f" -vendor {_shlex.quote(daemon)}"
+    exec_log = await ssh_execute(doc, cmd)
+    ok = exec_log.get("exit") == 0 or exec_log.get("mode") == "mock"
     await db.servers.update_one(
         {"id": server_id},
         {"$set": {"status": "up", "last_action": f"lmreread [{exec_log['mode']}] @ {datetime.now(timezone.utc).isoformat()}"}}
     )
-    await log_audit("LMREREAD", f"lmreread issued to {doc['name']} · {exec_log['output']}",
-                    server_id, doc["name"], "info")
-    return {"ok": True, "message": f"lmreread executed on {doc['name']}", "exec": exec_log}
+    await log_audit("LMREREAD",
+                    f"lmreread issued to {doc['name']} · exit={exec_log.get('exit')} · {(exec_log.get('output') or '')[:200]}",
+                    server_id, doc["name"], "success" if ok else "error")
+    return {"ok": ok, "message": f"lmreread executed on {doc['name']}", "exec": exec_log}
 
 
 @api_router.post("/servers/{server_id}/restart")
@@ -1359,25 +1372,30 @@ async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dic
         ("feature", payload.feature),
         ("user", payload.user),
         ("host", payload.host),
-        ("vendor_daemon", payload.vendor_daemon or doc.get("daemon", "")),
     ):
         if not value or not _SAFE.match(value):
             raise HTTPException(
                 400,
                 f"Invalid {label!r}: must match ^[A-Za-z0-9._@:/+-]+$ (got {value!r})",
             )
-    vendor_daemon = (payload.vendor_daemon or doc.get("daemon") or "").strip()
+    # display is optional, but if given must also be safe (allow colon for X11 ':0.0')
+    if payload.display and not _SAFE.match(payload.display):
+        raise HTTPException(400, f"Invalid display: {payload.display!r}")
     lmutil = ((doc.get("ssh") or {}).get("lmutil_path") or "lmutil").strip()
-    # FlexLM lmremove syntax with -h forces remove without confirmation:
-    #   lmremove -h <feature> <vendor_daemon> <host> <user>
-    # All four fields are pre-validated above; quote defensively anyway.
+    # Correct FlexLM lmremove syntax (via lmutil):
+    #   lmutil lmremove [-c port@host] feature user host [display]
+    # All identifiers are pre-validated above; quote defensively anyway.
+    target = f"{doc['port']}@{doc['host']}"
+    display = payload.display.strip() if payload.display else ""
     cmd = (
-        f"{_shlex.quote(lmutil)} lmremove -h "
+        f"{_shlex.quote(lmutil)} lmremove "
+        f"-c {_shlex.quote(target)} "
         f"{_shlex.quote(payload.feature)} "
-        f"{_shlex.quote(vendor_daemon)} "
-        f"{_shlex.quote(payload.host)} "
-        f"{_shlex.quote(payload.user)}"
+        f"{_shlex.quote(payload.user)} "
+        f"{_shlex.quote(payload.host)}"
     )
+    if display:
+        cmd += f" {_shlex.quote(display)}"
     exec_log = await ssh_execute(doc, cmd)
     ok = exec_log.get("exit") == 0 or exec_log.get("mode") == "mock"
     severity = "success" if ok else "error"
@@ -1502,7 +1520,8 @@ async def test_ssh(server_id: str, _: dict = Depends(require_admin)):
         return {"ok": False, "message": "Missing host or username", "mocked": True}
     if ssh.get("enabled") and PARAMIKO_AVAILABLE:
         res = await asyncio.to_thread(
-            _ssh_real_exec, ssh, f"echo licman-ok && which {ssh.get('lmutil_path','lmutil')} || true"
+            _ssh_real_exec, _ssh_with_decrypted(ssh),
+            f"echo licman-ok && which {ssh.get('lmutil_path','lmutil')} || true"
         )
         ok = res.get("exit") == 0
         await log_audit("SSH_TEST", f"SSH test {ssh['username']}@{ssh['host']} -> {res.get('output')[:200]}",
@@ -1546,27 +1565,38 @@ async def sync_server(server_id: str, _: dict = Depends(require_admin)):
 
 
 @api_router.post("/servers/{server_id}/fetch-license")
-async def fetch_license(server_id: str, _: dict = Depends(require_admin)):
-    """Pull the actual .lic file from the license host over SSH (cat)."""
+async def fetch_license(server_id: str, path: Optional[str] = None, _: dict = Depends(require_admin)):
+    """Pull the actual .lic file from the license host over SSH (cat).
+    If ?path= is provided, skip auto-discovery and cat that exact path.
+    """
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Server not found")
     ssh = doc.get("ssh", {}) or {}
     if doc.get("adapter_mode") != "ssh" or not ssh.get("enabled"):
         raise HTTPException(400, "SSH adapter not enabled on this server")
-    lmutil = ssh.get("lmutil_path") or "lmutil"
-    discover_cmd = (
-        f"{lmutil} lmdiag -c {doc['port']}@{doc['host']} 2>/dev/null "
-        f"| grep -m1 -oE '/[^ ]+\\.(lic|dat)' || true"
-    )
-    disc = await asyncio.to_thread(_ssh_real_exec, ssh, discover_cmd)
-    lic_path = (disc.get("output") or "").strip().splitlines()[0] if disc.get("output") else ""
+    ssh_decrypted = _ssh_with_decrypted(ssh)
+    lmutil = (ssh.get("lmutil_path") or "lmutil").strip()
+    lic_path = (path or "").strip()
     if not lic_path:
-        raise HTTPException(404, "Could not auto-discover license file path on remote host. "
-                                 "Pass ?path=/full/path/to/license.dat manually.")
-    res = await asyncio.to_thread(_ssh_real_exec, ssh, f"cat {lic_path}")
+        target = f"{doc['port']}@{doc['host']}"
+        discover_cmd = (
+            f"{_shlex.quote(lmutil)} lmdiag -c {_shlex.quote(target)} 2>/dev/null "
+            f"| grep -m1 -oE '/[^ ]+\\.(lic|dat)' || true"
+        )
+        disc = await asyncio.to_thread(_ssh_real_exec, ssh_decrypted, discover_cmd)
+        lic_path = (disc.get("output") or "").strip().splitlines()[0] if disc.get("output") else ""
+        if not lic_path:
+            raise HTTPException(
+                404,
+                "Could not auto-discover license file path on remote host. "
+                "Call this endpoint again with ?path=/full/path/to/license.dat",
+            )
+    res = await asyncio.to_thread(
+        _ssh_real_exec, ssh_decrypted, f"cat {_shlex.quote(lic_path)}"
+    )
     if res.get("exit") != 0 or not res.get("output"):
-        raise HTTPException(502, f"Failed to read remote license file: {res.get('output','')[:300]}")
+        raise HTTPException(502, f"Failed to read remote license file: {(res.get('output') or '')[:300]}")
     content = res["output"]
     await db.servers.update_one({"id": server_id}, {"$set": {"license_file": content}})
     await log_audit("LICENSE_FETCH",
@@ -2109,6 +2139,251 @@ async def usage_history_facets():
     }
 
 
+# ---------- Preemption ( SGE / FlexLM priority-based release ) ----------
+# A `priority_rule` describes WHO has what priority on WHICH feature(s).
+# Higher `priority` wins. When a higher-priority requester needs a feature
+# that is fully checked out, we find the lowest-priority current holder
+# and release them via lmremove (or SGE `qmod -d <jobid>` if SGE integration
+# is configured under /api/settings).
+#
+# Matching:
+#   - user_pattern   — exact user name OR glob like "rakella*"
+#   - group_pattern  — group name (resolved via SGE `qconf -shgrp` if enabled)
+#   - project_pattern— SGE project (`qstat -ext` shows project per job)
+#   - features       — list of feature names; empty list = applies to ALL features
+# Evaluation order: highest priority first; first match wins.
+
+class PriorityRule(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    priority: int = Field(ge=0, le=1000)
+    user_pattern: str = ""
+    group_pattern: str = ""
+    project_pattern: str = ""
+    features: List[str] = []
+    description: str = ""
+    enabled: bool = True
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PriorityRuleCreate(BaseModel):
+    name: str
+    priority: int = Field(ge=0, le=1000)
+    user_pattern: str = ""
+    group_pattern: str = ""
+    project_pattern: str = ""
+    features: List[str] = []
+    description: str = ""
+    enabled: bool = True
+
+
+class PreemptPayload(BaseModel):
+    server_id: str
+    feature: str
+    requester_user: str = ""
+    requester_group: str = ""
+    requester_project: str = ""
+    seats_needed: int = 1
+    dry_run: bool = False
+
+
+def _match_pattern(pat: str, value: str) -> bool:
+    """Glob-style match. Empty pattern never matches."""
+    if not pat:
+        return False
+    import fnmatch
+    return fnmatch.fnmatch(value or "", pat)
+
+
+async def _resolve_priority(user: str, group: str = "", project: str = "",
+                            feature: str = "") -> int:
+    """Return the priority an actor has for a given feature (0 = no rule matched)."""
+    rules = await db.priority_rules.find(
+        {"enabled": True}, {"_id": 0}
+    ).sort("priority", -1).to_list(500)
+    best = 0
+    for r in rules:
+        feats = r.get("features") or []
+        if feats and feature and feature not in feats:
+            continue
+        if _match_pattern(r.get("user_pattern", ""), user):
+            best = max(best, int(r.get("priority", 0)))
+        if group and _match_pattern(r.get("group_pattern", ""), group):
+            best = max(best, int(r.get("priority", 0)))
+        if project and _match_pattern(r.get("project_pattern", ""), project):
+            best = max(best, int(r.get("priority", 0)))
+    return best
+
+
+@api_router.get("/priority-rules", response_model=List[PriorityRule])
+async def list_priority_rules():
+    return await db.priority_rules.find({}, {"_id": 0}).sort("priority", -1).to_list(500)
+
+
+@api_router.post("/priority-rules", response_model=PriorityRule)
+async def create_priority_rule(payload: PriorityRuleCreate, _: dict = Depends(require_admin)):
+    rule = PriorityRule(**payload.model_dump())
+    await db.priority_rules.insert_one(rule.model_dump())
+    await log_audit("PRIORITY_ADD",
+                    f"Added priority rule '{rule.name}' (prio={rule.priority})",
+                    None, None, "info")
+    return rule
+
+
+@api_router.patch("/priority-rules/{rule_id}", response_model=PriorityRule)
+async def update_priority_rule(rule_id: str, payload: PriorityRuleCreate,
+                                _: dict = Depends(require_admin)):
+    data = payload.model_dump()
+    res = await db.priority_rules.find_one_and_update(
+        {"id": rule_id}, {"$set": data},
+        return_document=True, projection={"_id": 0},
+    )
+    if not res:
+        raise HTTPException(404, "Rule not found")
+    await log_audit("PRIORITY_UPDATE", f"Updated priority rule '{res['name']}'",
+                    None, None, "info")
+    return res
+
+
+@api_router.delete("/priority-rules/{rule_id}")
+async def delete_priority_rule(rule_id: str, _: dict = Depends(require_admin)):
+    res = await db.priority_rules.find_one_and_delete({"id": rule_id}, projection={"_id": 0})
+    if not res:
+        raise HTTPException(404, "Rule not found")
+    await log_audit("PRIORITY_DELETE", f"Deleted priority rule '{res['name']}'",
+                    None, None, "warning")
+    return {"ok": True}
+
+
+@api_router.post("/preempt/plan")
+async def preempt_plan(payload: PreemptPayload):
+    """Compute (but do NOT execute) which checkouts would be released to satisfy
+    the requester. Useful for previewing a preemption before clicking the
+    destructive button. Returns the holders sorted by ascending priority
+    (lowest priority first → first to release).
+    """
+    srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0})
+    if not srv:
+        raise HTTPException(404, "Server not found")
+    holders = await db.checkouts.find(
+        {"server_id": payload.server_id, "feature": payload.feature}, {"_id": 0}
+    ).to_list(500)
+    requester_prio = await _resolve_priority(
+        payload.requester_user, payload.requester_group,
+        payload.requester_project, payload.feature,
+    )
+    enriched = []
+    for h in holders:
+        hp = await _resolve_priority(h.get("user", ""), "", "", payload.feature)
+        enriched.append({**h, "holder_priority": hp})
+    # Releasable holders = those strictly lower priority than the requester
+    releasable = [h for h in enriched if h["holder_priority"] < requester_prio]
+    releasable.sort(key=lambda x: (x["holder_priority"], x.get("checkout_time", "")))
+    return {
+        "feature": payload.feature,
+        "server": srv["name"],
+        "requester_priority": requester_prio,
+        "current_holders": len(holders),
+        "releasable_holders": len(releasable),
+        "seats_needed": payload.seats_needed,
+        "can_satisfy": len(releasable) >= payload.seats_needed,
+        "targets": releasable[: payload.seats_needed],
+    }
+
+
+async def _sge_kill_job(ssh_decrypted: dict, user: str, host: str) -> Optional[dict]:
+    """Try to find the SGE job_id running on (user, host) and `qmod -d` it.
+    Falls back to None if no SGE integration configured or no matching job."""
+    cfg = await get_alert_settings()  # alerts collection also holds SGE keys
+    if not cfg.get("sge_enabled"):
+        return None
+    qstat = (cfg.get("sge_qstat_path") or "qstat").strip()
+    qmod = (cfg.get("sge_qmod_path") or "qmod").strip()
+    # qstat -u <user> -s r -F  →  one line per running job; we grep host.
+    list_cmd = (
+        f"{_shlex.quote(qstat)} -u {_shlex.quote(user)} -s r 2>/dev/null "
+        f"| awk -v h={_shlex.quote(host)} '$0 ~ h {{print $1; exit}}'"
+    )
+    r = await asyncio.to_thread(_ssh_real_exec, ssh_decrypted, list_cmd)
+    jid = (r.get("output") or "").strip().splitlines()[0] if r.get("output") else ""
+    if not jid or not jid.isdigit():
+        return None
+    kill_cmd = f"{_shlex.quote(qmod)} -d {_shlex.quote(jid)}"
+    k = await asyncio.to_thread(_ssh_real_exec, ssh_decrypted, kill_cmd)
+    return {"job_id": jid, "exit": k.get("exit"), "output": (k.get("output") or "")[:300]}
+
+
+@api_router.post("/preempt/run")
+async def preempt_run(payload: PreemptPayload, _: dict = Depends(require_admin)):
+    """Execute the preemption plan. For each target holder:
+      1. Try SGE  qmod -d <job_id>  (graceful, cleans up the user's job)
+      2. Fallback to lmutil lmremove (force-yank the license seat)
+    Records every action in the audit log.
+    """
+    plan = await preempt_plan(payload)
+    if not plan["can_satisfy"]:
+        return {
+            "ok": False,
+            "plan": plan,
+            "message": (
+                f"Cannot preempt — requester priority {plan['requester_priority']} "
+                f"has only {plan['releasable_holders']} releasable holder(s) "
+                f"but needs {payload.seats_needed}."
+            ),
+        }
+    if payload.dry_run:
+        return {"ok": True, "dry_run": True, "plan": plan}
+
+    srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0})
+    ssh = srv.get("ssh", {}) or {}
+    ssh_decrypted = _ssh_with_decrypted(ssh) if ssh else {}
+    actions = []
+    for target in plan["targets"]:
+        method, result = None, None
+        # 1) try SGE qmod -d first (only if real SSH + sge enabled)
+        if srv.get("adapter_mode") == "ssh" and ssh.get("enabled"):
+            sge_res = await _sge_kill_job(ssh_decrypted, target["user"], target["host"])
+            if sge_res:
+                method = "sge"
+                result = sge_res
+        # 2) fallback to lmutil lmremove
+        if result is None:
+            kill_payload = KillCheckoutPayload(
+                feature=target["feature"], user=target["user"],
+                host=target["host"], display=target.get("display", "") or "",
+            )
+            try:
+                kr = await kill_checkout(payload.server_id, kill_payload, _)
+                method = "lmremove"
+                result = kr.get("exec")
+            except HTTPException as e:
+                method = "error"
+                result = {"output": e.detail, "exit": -1}
+        actions.append({
+            "user": target["user"], "host": target["host"],
+            "feature": target["feature"], "holder_priority": target["holder_priority"],
+            "method": method, "result": result,
+        })
+    await log_audit(
+        "PREEMPT",
+        f"Preempted {len(actions)} holder(s) of {payload.feature} on {srv['name']} "
+        f"for requester={payload.requester_user or payload.requester_group or payload.requester_project} "
+        f"(prio={plan['requester_priority']})",
+        payload.server_id, srv["name"], "warning",
+    )
+    return {"ok": True, "plan": plan, "actions": actions}
+
+
+@api_router.get("/preempt/who-am-i")
+async def preempt_who_am_i(user: str = "", group: str = "", project: str = "",
+                           feature: str = ""):
+    """Convenience helper for the UI — returns the priority an actor currently has."""
+    prio = await _resolve_priority(user, group, project, feature)
+    return {"user": user, "group": group, "project": project,
+            "feature": feature, "priority": prio}
+
+
 @api_router.get("/stats")
 async def stats():
     servers = await db.servers.find({}, {"_id": 0}).to_list(500)
@@ -2131,13 +2406,22 @@ async def stats():
 
 @api_router.post("/seed/reset")
 async def seed_reset(_: dict = Depends(require_admin)):
-    await db.servers.delete_many({})
+    """Clear transient history (checkouts, alerts, audit, usage) WITHOUT
+    deleting user-defined servers, reservations or SSH credentials. Demo
+    seed data is recreated ONLY if the servers collection is already empty
+    (fresh install). Safe to call against a production deployment.
+    """
     await db.checkouts.delete_many({})
-    await db.reservations.delete_many({})
-    await db.audit.delete_many({})
     await db.alert_events.delete_many({})
+    await db.audit.delete_many({})
     await db.usage_history.delete_many({})
-    await seed_if_empty()
+    # Only seed demo servers if there are NO servers yet — never overwrite
+    # user-added production servers.
+    if (await db.servers.count_documents({})) == 0:
+        await seed_if_empty()
+    await log_audit("MAINT_CLEAR", "Cleared transient history (checkouts/alerts/audit/usage)",
+                    None, None, "warning")
+    return {"ok": True, "message": "Transient history cleared — user servers preserved"}
     return {"ok": True}
 
 

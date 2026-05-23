@@ -56,13 +56,17 @@ export default function Dashboard() {
     });
   };
 
-  const handleReset = async () => {
+  const handleClearHistory = async () => {
+    if (!window.confirm(
+      "Clear transient history (live checkouts, alerts, audit log, usage)?\n\n" +
+      "Your servers, SSH credentials, reservations and priority rules are PRESERVED."
+    )) return;
     try {
-      await api.resetSeed();
-      toast.success("Demo data reseeded");
+      await api.clearHistory();
+      toast.success("History cleared · servers preserved");
       load();
-    } catch {
-      toast.error("Reset failed");
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Clear failed");
     }
   };
 
@@ -104,7 +108,7 @@ export default function Dashboard() {
         stats={stats}
         autoRefresh={autoRefresh}
         onToggleRefresh={toggleRefresh}
-        onReset={handleReset}
+        onReset={handleClearHistory}
       />
 
       <main className="max-w-[1600px] mx-auto px-6 py-6 space-y-6">
