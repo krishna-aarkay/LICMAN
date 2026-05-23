@@ -63,9 +63,26 @@ Follow-ups:
 - **Kill buttons** added to Dashboard CheckoutTable rows + ServerDetail Checkouts tab + Feature Detail modal (all admin-gated).
 - **Sortable column headers** on Dashboard CheckoutTable, Expiry table, and the new Usage detail/aggregate tables. Permanent expirations stay pinned at the bottom regardless of sort direction.
 
+## Iteration 9 — Production correctness + SGE preemption — 2026-02
+**4 bug fixes:**
+- **RESET no longer wipes user-added servers**. `POST /api/seed/reset` now only clears transient history (checkouts, alerts, audit log, usage history) and reseeds demo servers ONLY when the servers collection is empty. The Dashboard button is renamed `CLEAR HIST` with a confirm modal explaining what's preserved.
+- **lmreread fixed** — was emitting `lmreread -c @{port}@{host}` (stray `@`). Now emits proper `lmutil lmreread -c {port}@{host} -vendor {daemon}`.
+- **fetch-license + ssh/test fixed** — both endpoints were passing *encrypted* SSH credentials to `_ssh_real_exec` ("authentication failed"). Now route through `_ssh_with_decrypted(ssh)` like `_real_checkouts_via_ssh` does.
+- **kill-checkout fixed** — wrong lmremove argument order ("no such feature"). Now: `lmutil lmremove -c {port}@{host} {feature} {user} {host} [display]`. Removed mandatory vendor_daemon validation since it's not used in this form.
+
+**NEW: Priority &amp; Preemption (SGE-aware):**
+- New `priority_rules` collection + full CRUD at `/api/priority-rules` (admin only)
+- Match by user_pattern / group_pattern / project_pattern (glob); scope by feature list (empty = all features)
+- `POST /api/preempt/plan` — preview which lowest-priority holders would be released
+- `POST /api/preempt/run` — execute via `qmod -d <jobid>` (SGE) → falls back to `lmremove`
+- `GET /api/preempt/who-am-i` — convenience helper to look up an actor's priority
+- Settings extended with `sge_enabled` / `sge_qstat_path` / `sge_qmod_path` (panel added)
+- New `/priority` page (admin) with rules table, editor, and manual preemption tester
+- All preempt endpoints gated behind `require_admin`
+
 ## Testing
-- Backend: **111/111 pytests** passing (iter4 + iter6 + iter7 + iter8 = 27+18+21+24+misc + injection test)
-- Frontend: **19/19 critical UI flows** verified across iterations 5–8
+- Backend: **151/151 pytests** passing (40 iter9 + 24 iter8 regression + iter7/6/5/4)
+- Frontend: **25/25 critical UI flows** verified across iterations 5–9
 
 ## Iteration 7 — "Add all the best" final feature batch — 2026-02
 - **Bulk operations**: `POST /api/servers/sync-all` and `POST /api/servers/reread-all` for one-click maintenance across the fleet (admin-only). Dashboard exposes new `SYNC ALL` and `REREAD ALL` buttons gated to admin.

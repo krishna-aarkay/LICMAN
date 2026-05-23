@@ -2257,7 +2257,7 @@ async def delete_priority_rule(rule_id: str, _: dict = Depends(require_admin)):
 
 
 @api_router.post("/preempt/plan")
-async def preempt_plan(payload: PreemptPayload):
+async def preempt_plan(payload: PreemptPayload, _: dict = Depends(require_admin)):
     """Compute (but do NOT execute) which checkouts would be released to satisfy
     the requester. Useful for previewing a preemption before clicking the
     destructive button. Returns the holders sorted by ascending priority
@@ -2315,13 +2315,13 @@ async def _sge_kill_job(ssh_decrypted: dict, user: str, host: str) -> Optional[d
 
 
 @api_router.post("/preempt/run")
-async def preempt_run(payload: PreemptPayload, _: dict = Depends(require_admin)):
+async def preempt_run(payload: PreemptPayload, admin: dict = Depends(require_admin)):
     """Execute the preemption plan. For each target holder:
       1. Try SGE  qmod -d <job_id>  (graceful, cleans up the user's job)
       2. Fallback to lmutil lmremove (force-yank the license seat)
     Records every action in the audit log.
     """
-    plan = await preempt_plan(payload)
+    plan = await preempt_plan(payload, admin)
     if not plan["can_satisfy"]:
         return {
             "ok": False,
@@ -2354,7 +2354,7 @@ async def preempt_run(payload: PreemptPayload, _: dict = Depends(require_admin))
                 host=target["host"], display=target.get("display", "") or "",
             )
             try:
-                kr = await kill_checkout(payload.server_id, kill_payload, _)
+                kr = await kill_checkout(payload.server_id, kill_payload, admin)
                 method = "lmremove"
                 result = kr.get("exec")
             except HTTPException as e:
@@ -2422,7 +2422,6 @@ async def seed_reset(_: dict = Depends(require_admin)):
     await log_audit("MAINT_CLEAR", "Cleared transient history (checkouts/alerts/audit/usage)",
                     None, None, "warning")
     return {"ok": True, "message": "Transient history cleared — user servers preserved"}
-    return {"ok": True}
 
 
 app.include_router(public_router)
