@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
-import { Server, Power, RefreshCw, ChevronRight } from "lucide-react";
+import { Server, Power, RefreshCw, ChevronRight, Trash2 } from "lucide-react";
 import { vendorMeta, api } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 
 export const ServerCard = ({ server, onChange }) => {
@@ -8,6 +9,7 @@ export const ServerCard = ({ server, onChange }) => {
   const totalFeat = server.features?.length || 0;
   const totalSeats = server.features?.reduce((a, f) => a + f.total, 0) || 0;
   const isUp = server.status === "up";
+  const { isAdmin } = useAuth();
 
   const handle = async (fn, msg) => {
     try {
@@ -16,6 +18,21 @@ export const ServerCard = ({ server, onChange }) => {
       onChange?.();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Action failed");
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm(
+      `Permanently remove "${server.name}" from LICMAN?\n\n` +
+      `This deletes its SSH credentials, options file, reservations and live checkouts. ` +
+      `The license server itself is NOT touched — you can re-add it any time.`,
+    )) return;
+    try {
+      await api.deleteServer(server.id);
+      toast.success(`${server.name} removed`);
+      onChange?.();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Delete failed");
     }
   };
 
@@ -109,6 +126,16 @@ export const ServerCard = ({ server, onChange }) => {
         >
           {isUp ? "STOP" : "START"}
         </button>
+        {isAdmin && (
+          <button
+            className="btn-brutal text-[10px] py-1.5 px-2 border-red-900/60 text-red-400 hover:bg-red-900/20"
+            onClick={handleDelete}
+            data-testid={`btn-delete-${server.id}`}
+            title="Permanently remove this server from LICMAN"
+          >
+            <Trash2 size={11} />
+          </button>
+        )}
       </div>
     </div>
   );

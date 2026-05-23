@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Zap, Plus, Trash2, Save, AlertTriangle, Crown, Edit3 } from "lucide-react";
+import { Zap, Plus, Trash2, Save, AlertTriangle, Crown, Edit3, Database, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import Header from "@/components/Header";
 import { toast } from "sonner";
@@ -34,6 +34,25 @@ export default function Priority() {
   const [runResult, setRunResult] = useState(null);
   const [planning, setPlanning] = useState(false);
   const [running, setRunning] = useState(false);
+
+  // SGE auto-discovery
+  const [sge, setSge] = useState({ users: [], groups: [], projects: [], loaded: false });
+  const [sgeLoading, setSgeLoading] = useState(false);
+
+  const loadSge = async () => {
+    setSgeLoading(true);
+    try {
+      const [u, g, p] = await Promise.all([api.sgeUsers(), api.sgeGroups(), api.sgeProjects()]);
+      setSge({ users: u.users || [], groups: g.groups || [], projects: p.projects || [], loaded: true });
+      toast.success(
+        `SGE: ${u.users?.length || 0} users · ${g.groups?.length || 0} groups · ${p.projects?.length || 0} projects`,
+      );
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "SGE query failed. Is SGE enabled in Settings and is at least one server SSH-configured?");
+    } finally {
+      setSgeLoading(false);
+    }
+  };
 
   const load = async () => {
     const [r, s, st] = await Promise.all([api.listPriorityRules(), api.listServers(), api.stats()]);
@@ -182,6 +201,38 @@ export default function Priority() {
           </button>
         </div>
 
+        {/* SGE auto-discovery banner */}
+        <section
+          className="bg-[#111] border border-[#222] rounded-sm p-3 flex items-center justify-between flex-wrap gap-3"
+          data-testid="sge-discovery-banner"
+        >
+          <div className="font-mono text-[11px] text-[#9ca3af] flex items-center gap-2">
+            <Database size={14} className="text-blue-400" />
+            {sge.loaded ? (
+              <span>
+                SGE catalogue loaded ·{" "}
+                <span className="text-emerald-400">{sge.users.length}</span> users ·{" "}
+                <span className="text-emerald-400">{sge.groups.length}</span> groups ·{" "}
+                <span className="text-emerald-400">{sge.projects.length}</span> projects
+              </span>
+            ) : (
+              <span>
+                Pull users / @groups / projects directly from Son of Grid Engine — saves you from
+                typing patterns by hand.
+              </span>
+            )}
+          </div>
+          <button
+            onClick={loadSge}
+            disabled={sgeLoading}
+            className="btn-brutal flex items-center gap-1.5 disabled:opacity-50"
+            data-testid="sge-pull-btn"
+          >
+            <RefreshCw size={11} className={sgeLoading ? "animate-spin" : ""} />
+            {sgeLoading ? "QUERYING SGE…" : sge.loaded ? "REFRESH SGE" : "PULL FROM SGE"}
+          </button>
+        </section>
+
         {/* Rules table */}
         <section className="bg-[#111] border border-[#222] rounded-sm">
           <div className="px-4 py-3 border-b border-[#222] flex items-center gap-2">
@@ -282,13 +333,31 @@ export default function Priority() {
                 />
               </Field>
               <Field label="User pattern (glob, e.g. rakella* )">
-                <input value={form.user_pattern} onChange={(e) => setForm({ ...form, user_pattern: e.target.value })} className="inp" data-testid="rule-user" />
+                <input
+                  value={form.user_pattern}
+                  onChange={(e) => setForm({ ...form, user_pattern: e.target.value })}
+                  list="sge-users-list"
+                  className="inp"
+                  data-testid="rule-user"
+                />
               </Field>
               <Field label="Group pattern (SGE @group)">
-                <input value={form.group_pattern} onChange={(e) => setForm({ ...form, group_pattern: e.target.value })} className="inp" data-testid="rule-group" />
+                <input
+                  value={form.group_pattern}
+                  onChange={(e) => setForm({ ...form, group_pattern: e.target.value })}
+                  list="sge-groups-list"
+                  className="inp"
+                  data-testid="rule-group"
+                />
               </Field>
               <Field label="Project pattern (SGE project)">
-                <input value={form.project_pattern} onChange={(e) => setForm({ ...form, project_pattern: e.target.value })} className="inp" data-testid="rule-project" />
+                <input
+                  value={form.project_pattern}
+                  onChange={(e) => setForm({ ...form, project_pattern: e.target.value })}
+                  list="sge-projects-list"
+                  className="inp"
+                  data-testid="rule-project"
+                />
               </Field>
               <Field label="Features (comma-sep, blank = ALL)">
                 <input value={form.features} onChange={(e) => setForm({ ...form, features: e.target.value })} placeholder="Innovus, Genus, VCS-RuntimeNetlist" className="inp" data-testid="rule-features" />
@@ -476,6 +545,23 @@ export default function Priority() {
           )}
         </section>
       </main>
+
+      {/* Shared datalists for autocomplete from SGE */}
+      <datalist id="sge-users-list">
+        {sge.users.map((u) => (
+          <option key={u} value={u} />
+        ))}
+      </datalist>
+      <datalist id="sge-groups-list">
+        {sge.groups.map((g) => (
+          <option key={g} value={g} />
+        ))}
+      </datalist>
+      <datalist id="sge-projects-list">
+        {sge.projects.map((p) => (
+          <option key={p} value={p} />
+        ))}
+      </datalist>
 
       <style>{`
         .inp {

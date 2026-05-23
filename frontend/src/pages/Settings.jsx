@@ -323,15 +323,31 @@ export default function Settings() {
             </Panel>
 
             <Panel title="SON OF GRID ENGINE (SGE)" icon={Crown}>
-              <div className="mb-3 flex items-start gap-2 text-[10px] font-mono text-[#9ca3af]">
-                <Info size={12} className="mt-0.5 shrink-0" />
-                <div>
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-mono text-[10px] text-[#9ca3af] flex-1 pr-4">
                   When SGE is enabled, the Priority &amp; Preemption page will try{" "}
                   <span className="text-emerald-400">qmod -d &lt;jobid&gt;</span> first
                   (graceful — kills the user&apos;s scheduled job) before falling back to
                   <span className="text-amber-400"> lmremove </span>
-                  (force-yank the license seat). Both binaries are looked up on the LICENSE host over the same SSH connection used for lmstat.
+                  (force-yank the license seat). Auto-discovery uses{" "}
+                  <span className="text-emerald-400">qconf -suserl / -shgrpl / -sprjl</span>.
                 </div>
+                <button
+                  className="btn-brutal flex items-center gap-1.5 text-[10px] py-1"
+                  onClick={async () => {
+                    try {
+                      const r = await api.sgeTest();
+                      if (r.ok) toast.success("SGE reachable ✓");
+                      else toast.error(r.error || r.output?.slice(0, 120) || "SGE test failed");
+                    } catch (e) {
+                      toast.error(e?.response?.data?.detail || "SGE test failed");
+                    }
+                  }}
+                  disabled={!cfg.sge_enabled}
+                  data-testid="sge-test-btn"
+                >
+                  <Send size={11} /> TEST SGE
+                </button>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                 <Field label="qstat path">

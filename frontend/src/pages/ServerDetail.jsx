@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useParams, Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, FileText, Settings, ListChecks, Save, Plus, Trash2, RefreshCw, Power, Activity, Plug, Download, RotateCw } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api, vendorMeta, fmtAgo } from "@/lib/api";
@@ -31,6 +31,7 @@ const daysUntil = (d) => (d ? Math.floor((d - new Date()) / 86400000) : null);
 
 export default function ServerDetail() {
   const { id } = useParams();
+  const nav = useNavigate();
   const { isAdmin } = useAuth();
   const [server, setServer] = useState(null);
   const [licText, setLicText] = useState("");
@@ -47,6 +48,8 @@ export default function ServerDetail() {
   const [validating, setValidating] = useState(false);
   const [selectedFeature, setSelectedFeature] = useState(null);
   const [killing, setKilling] = useState(null);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [rawLmstat, setRawLmstat] = useState(null);
 
   // remember last visited server
   useEffect(() => {
@@ -143,6 +146,34 @@ export default function ServerDetail() {
       toast.error(e?.response?.data?.detail || "Kill failed");
     } finally {
       setKilling(null);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm(
+      `Permanently remove "${server?.name}" from LICMAN?\n\n` +
+      `Deletes its SSH credentials, options file, reservations and live checkouts. ` +
+      `The license server itself is NOT touched.`,
+    )) return;
+    try {
+      await api.deleteServer(id);
+      toast.success(`${server.name} removed`);
+      nav("/");
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Delete failed");
+    }
+  };
+
+  const runDiagnose = async () => {
+    setDiagnosing(true);
+    setRawLmstat(null);
+    try {
+      const r = await api.diagnose(id);
+      setRawLmstat(r);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Diagnose failed");
+    } finally {
+      setDiagnosing(false);
     }
   };
 
@@ -270,8 +301,79 @@ export default function ServerDetail() {
               >
                 <Activity size={12} /> {isUp ? "STOP" : "START"}
               </button>
+              {server.adapter_mode === "ssh" && isAdmin && (
+                <button
+                  className="btn-brutal flex items-center gap-1.5"
+                  onClick={runDiagnose}
+                  disabled={diagnosing}
+                  data-testid="srv-diagnose"
+                  title="Show RAW lmstat output — verify your parser is seeing real checkouts"
+                >
+                  <ListChecks size={12} />
+                  {diagnosing ? "RUNNING…" : "RAW LMSTAT"}
+                </button>
+              )}
+              {isAdmin && (
+                <button
+                  className="btn-brutal flex items-center gap-1.5 border-red-900/60 text-red-400 hover:bg-red-900/20"
+                  onClick={handleDelete}
+                  data-testid="srv-delete"
+                  title="Permanently remove this server from LICMAN"
+                >
+                  <Trash2 size={12} /> REMOVE
+                </button>
+              )}
             </div>
           </div>
+
+          {rawLmstat && (
+            <div
+              className="mt-4 border border-amber-900/40 bg-[#0a0a0a] rounded-sm"
+              data-testid="raw-lmstat-panel"
+            >
+              <div className="px-3 py-2 border-b border-[#222] flex items-center justify-between flex-wrap gap-2 font-mono text-[10px] uppercase tracking-wider">
+                <div className="flex items-center gap-3">
+                  <span className="text-amber-400 font-bold">RAW LMSTAT · {rawLmstat.mode}</span>
+                  <span className="text-[#6b7280]">
+                    {rawLmstat.lmstat.lines} lines · parsed {rawLmstat.lmstat.parsed_features}{" "}
+                    features · {rawLmstat.lmstat.parsed_checkouts} checkouts · exit{" "}
+                    {rawLmstat.lmstat.exit}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setRawLmstat(null)}
+                  className="text-[#9ca3af] hover:text-white"
+                  data-testid="raw-lmstat-close"
+                >
+                  ✕ HIDE
+                </button>
+              </div>
+              <div className="px-3 py-2 border-b border-[#1a1a1a] font-mono text-[10px] text-[#9ca3af]">
+                <span className="text-[#6b7280]">lmutil →</span>{" "}
+                <span className="text-white">{rawLmstat.lmutil_resolved || "—"}</span>
+              </div>
+              <pre
+                className="px-3 py-2 font-mono text-[11px] text-[#9ca3af] whitespace-pre-wrap max-h-[40vh] overflow-y-auto"
+                data-testid="raw-lmstat-output"
+              >
+                {rawLmstat.lmstat.output || "(no output)"}
+              </pre>
+              {rawLmstat.lmstat.parsed_features === 0 && rawLmstat.lmstat.lines > 0 && (
+                <div className="px-3 py-2 border-t border-[#1a1a1a] font-mono text-[11px] text-amber-400">
+                  ⚠ lmstat returned {rawLmstat.lmstat.lines} lines but the LICMAN parser
+                  extracted 0 features. Common causes: locale (run `LANG=C lmstat` on host),
+                  custom output format, or daemon name mismatch. Paste a snippet above to your
+                  admin to update the regex.
+                </div>
+              )}
+              {rawLmstat.lmstat.parsed_features > 0 && (
+                <div className="px-3 py-2 border-t border-[#1a1a1a] font-mono text-[11px] text-emerald-400">
+                  ✓ Parser is healthy. If the Dashboard still shows zero checkouts, click SYNC NOW
+                  above — the parsed result is persisted to MongoDB on each sync.
+                </div>
+              )}
+            </div>
+          )}
 
           {/* features — clickable rows that drill into per-feature checkouts */}
           <div className="mt-5 border border-[#222] bg-[#0a0a0a] rounded-sm" data-testid="features-list">

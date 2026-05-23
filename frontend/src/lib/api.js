@@ -58,9 +58,19 @@ export const api = {
   sync: (id) => http.post(`/servers/${id}/sync`).then((r) => r.data),
   syncAll: () => http.post(`/servers/sync-all`).then((r) => r.data),
   rereadAll: () => http.post(`/servers/reread-all`).then((r) => r.data),
+  diagnose: (id) => http.post(`/servers/${id}/diagnose`).then((r) => r.data),
   validateOptions: (id, content) =>
     http.post(`/servers/${id}/options/validate`, { content }).then((r) => r.data),
-  fetchLicense: (id) => http.post(`/servers/${id}/fetch-license`).then((r) => r.data),
+  fetchLicense: (id, path) =>
+    http.post(`/servers/${id}/fetch-license`, null, {
+      params: path ? { path } : {},
+    }).then((r) => r.data),
+
+  // SGE auto-discovery
+  sgeUsers: () => http.get(`/sge/users`).then((r) => r.data),
+  sgeGroups: () => http.get(`/sge/groups`).then((r) => r.data),
+  sgeProjects: () => http.get(`/sge/projects`).then((r) => r.data),
+  sgeTest: () => http.get(`/sge/test`).then((r) => r.data),
   saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
   setAdapter: (id, mode) =>
     http.put(`/servers/${id}/adapter`, { adapter_mode: mode }).then((r) => r.data),

@@ -80,9 +80,16 @@ Follow-ups:
 - New `/priority` page (admin) with rules table, editor, and manual preemption tester
 - All preempt endpoints gated behind `require_admin`
 
+## Iteration 10 — UX gaps + SGE auto-discovery — 2026-02
+
+**3 issues addressed:**
+- **Delete server** — added trash button on every ServerCard (Dashboard) + REMOVE button on ServerDetail header. Both admin-only with confirm() dialog. Backend `DELETE /api/servers/{id}` already existed.
+- **RAW LMSTAT diagnostic** — new admin button on ServerDetail → `POST /api/servers/{id}/diagnose` runs `lmutil lmstat -a -c port@host` over the user's SSH connection and returns the unparsed output, the parser's interpretation (features/checkouts counts), and a `command -v lmutil` resolved path. UI surfaces the raw text plus actionable diagnosis ("parser is healthy" vs "parser saw 0 of N lines"). This is the single most valuable button when integrating with real Cadence/Synopsys/Siemens output.
+- **SGE auto-discovery** — new endpoints `GET /api/sge/users`, `/sge/groups`, `/sge/projects`, `/sge/test` shell out to `qconf -suserl / -shgrpl / -sprjl` over the same SSH connection as lmstat. Priority page has a `PULL FROM SGE` button that loads all three lists; each editor input gets HTML `<datalist>` autocomplete so admins type-ahead from real SGE catalog instead of guessing patterns. Settings page got a `TEST SGE` button for one-click smoke check.
+
 ## Testing
-- Backend: **151/151 pytests** passing (40 iter9 + 24 iter8 regression + iter7/6/5/4)
-- Frontend: **25/25 critical UI flows** verified across iterations 5–9
+- Backend: **151/151 pytests** still passing + new endpoints smoke-tested via curl
+- Frontend: delete button verified live on 5 server cards, Priority PULL FROM SGE button visible
 
 ## Iteration 7 — "Add all the best" final feature batch — 2026-02
 - **Bulk operations**: `POST /api/servers/sync-all` and `POST /api/servers/reread-all` for one-click maintenance across the fleet (admin-only). Dashboard exposes new `SYNC ALL` and `REREAD ALL` buttons gated to admin.

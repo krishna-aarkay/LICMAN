@@ -1356,6 +1356,61 @@ class KillCheckoutPayload(BaseModel):
     vendor_daemon: str = ""  # e.g. "snpslmd", "cdslmd". If empty, uses server.daemon
 
 
+@api_router.post("/servers/{server_id}/diagnose")
+async def diagnose_server(server_id: str, _: dict = Depends(require_admin)):
+    """RAW lmstat output for debugging. Runs the same lmstat command we'd use
+    for sync but returns the unparsed output so you can verify what your real
+    server is reporting and tune the regex if anything is missed.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    ssh = doc.get("ssh", {}) or {}
+    is_ssh = doc.get("adapter_mode") == "ssh" and ssh.get("enabled") and PARAMIKO_AVAILABLE
+    lmutil = (ssh.get("lmutil_path") or "lmutil").strip()
+    target = f"{doc['port']}@{doc['host']}"
+    cmd_stat = f"{_shlex.quote(lmutil)} lmstat -a -c {_shlex.quote(target)}"
+    cmd_diag = f"{_shlex.quote(lmutil)} lmdiag -c {_shlex.quote(target)} -n 2>&1 | head -200"
+    cmd_which = f"command -v {_shlex.quote(lmutil)} || echo 'NOT FOUND'"
+    if is_ssh:
+        ssh_dec = _ssh_with_decrypted(ssh)
+        which_r = await asyncio.to_thread(_ssh_real_exec, ssh_dec, cmd_which)
+        stat_r = await asyncio.to_thread(_ssh_real_exec, ssh_dec, cmd_stat)
+        diag_r = await asyncio.to_thread(_ssh_real_exec, ssh_dec, cmd_diag)
+    else:
+        which_r = {"output": f"[mock] {lmutil} → /opt/flexlm/lmutil", "exit": 0, "mode": "mock"}
+        stat_r = {"output": "[mock] lmstat not run — switch adapter_mode='ssh' to see real output",
+                  "exit": -1, "mode": "mock"}
+        diag_r = {"output": "[mock]", "exit": -1, "mode": "mock"}
+    # Re-run the parser on the captured stat output so we can show "parsed N / raw M lines"
+    parsed_features, parsed_checkouts = 0, 0
+    try:
+        if stat_r.get("output"):
+            p = parse_lmstat_a(stat_r["output"], server_id)
+            parsed_features = len(p.get("features", []))
+            parsed_checkouts = len(p.get("checkouts", []))
+    except Exception as e:
+        logger.warning(f"diagnose parser failed: {e}")
+    return {
+        "server": doc["name"],
+        "mode": "ssh" if is_ssh else "mock",
+        "lmutil_resolved": (which_r.get("output") or "").strip(),
+        "lmstat": {
+            "command": cmd_stat,
+            "exit": stat_r.get("exit"),
+            "output": stat_r.get("output", ""),
+            "lines": len((stat_r.get("output") or "").splitlines()),
+            "parsed_features": parsed_features,
+            "parsed_checkouts": parsed_checkouts,
+        },
+        "lmdiag": {
+            "command": cmd_diag,
+            "exit": diag_r.get("exit"),
+            "output": (diag_r.get("output") or "")[:8000],
+        },
+    }
+
+
 @api_router.post("/servers/{server_id}/checkouts/kill")
 async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dict = Depends(require_admin)):
     """Forcibly release a checked-out license via `lmremove`.
@@ -2382,6 +2437,106 @@ async def preempt_who_am_i(user: str = "", group: str = "", project: str = "",
     prio = await _resolve_priority(user, group, project, feature)
     return {"user": user, "group": group, "project": project,
             "feature": feature, "priority": prio}
+
+
+# ---------- SGE auto-discovery ----------
+# When sge_enabled is true, these endpoints SSH into the first ssh-enabled server
+# (assumed to share the SGE qmaster's $SGE_ROOT) and run qconf to enumerate
+# real users / groups / projects so the admin doesn't have to type them by hand.
+
+async def _pick_sge_ssh_server() -> Optional[dict]:
+    """Pick any ssh-enabled server as the SGE control host. Caller can override
+    via the alert settings doc later if their qmaster lives elsewhere."""
+    return await db.servers.find_one(
+        {"adapter_mode": "ssh", "ssh.enabled": True}, {"_id": 0}
+    )
+
+
+async def _sge_run(cmd: str) -> dict:
+    """Run an SGE command (qconf/qstat) over SSH on the picked host."""
+    cfg = await get_alert_settings()
+    if not cfg.get("sge_enabled"):
+        raise HTTPException(400, "SGE integration is disabled in Settings")
+    srv = await _pick_sge_ssh_server()
+    if not srv:
+        raise HTTPException(400, "No SSH-enabled server available to reach SGE. "
+                                  "Configure SSH on at least one license host first.")
+    ssh = srv.get("ssh", {}) or {}
+    res = await asyncio.to_thread(_ssh_real_exec, _ssh_with_decrypted(ssh), cmd)
+    return {"server": srv["name"], "host": ssh.get("host"), **res}
+
+
+def _qconf_path(cfg: dict) -> str:
+    # Reuse qstat dir if user supplied an absolute path; otherwise rely on $PATH
+    qstat = (cfg.get("sge_qstat_path") or "qstat").strip()
+    if "/" in qstat:
+        from os.path import dirname, join
+        return join(dirname(qstat), "qconf")
+    return "qconf"
+
+
+@api_router.get("/sge/users")
+async def sge_users(_: dict = Depends(require_admin)):
+    """List active SGE submit-users (`qconf -suserl` + any usernames seen in
+    currently running jobs via `qstat -u '*' -s r`).
+    """
+    cfg = await get_alert_settings()
+    qconf = _qconf_path(cfg)
+    qstat = (cfg.get("sge_qstat_path") or "qstat").strip()
+    out_users = await _sge_run(f"{_shlex.quote(qconf)} -suserl 2>/dev/null || true")
+    seen = {u.strip() for u in (out_users.get("output") or "").splitlines() if u.strip()}
+    # also union users currently running jobs
+    out_running = await _sge_run(
+        f"{_shlex.quote(qstat)} -u '*' -s r 2>/dev/null | awk 'NR>2 {{print $4}}' | sort -u || true"
+    )
+    for u in (out_running.get("output") or "").splitlines():
+        u = u.strip()
+        if u and not u.startswith("queuename") and not u.startswith("---"):
+            seen.add(u)
+    return {"users": sorted(seen), "source": out_users.get("server")}
+
+
+@api_router.get("/sge/groups")
+async def sge_groups(_: dict = Depends(require_admin)):
+    """List SGE host & user-set groups (`qconf -shgrpl` and per-group resolve)."""
+    cfg = await get_alert_settings()
+    qconf = _qconf_path(cfg)
+    out = await _sge_run(f"{_shlex.quote(qconf)} -shgrpl 2>/dev/null || true")
+    groups = [g.strip() for g in (out.get("output") or "").splitlines() if g.strip()]
+    # Also try `qconf -sul` for user-set lists (ACL-style groups)
+    out_acl = await _sge_run(f"{_shlex.quote(qconf)} -sul 2>/dev/null || true")
+    acls = [g.strip() for g in (out_acl.get("output") or "").splitlines() if g.strip()]
+    return {"groups": sorted(set(groups) | set(acls)), "source": out.get("server")}
+
+
+@api_router.get("/sge/projects")
+async def sge_projects(_: dict = Depends(require_admin)):
+    """List SGE projects (`qconf -sprjl`)."""
+    cfg = await get_alert_settings()
+    qconf = _qconf_path(cfg)
+    out = await _sge_run(f"{_shlex.quote(qconf)} -sprjl 2>/dev/null || true")
+    projects = [p.strip() for p in (out.get("output") or "").splitlines() if p.strip()]
+    return {"projects": sorted(projects), "source": out.get("server")}
+
+
+@api_router.get("/sge/test")
+async def sge_test(_: dict = Depends(require_admin)):
+    """Smoke-test: confirm we can reach SGE (`qstat -help` should always work)."""
+    cfg = await get_alert_settings()
+    qstat = (cfg.get("sge_qstat_path") or "qstat").strip()
+    try:
+        out = await _sge_run(f"{_shlex.quote(qstat)} -help 2>&1 | head -3")
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    ok = out.get("exit") == 0
+    return {
+        "ok": ok,
+        "exit": out.get("exit"),
+        "command": f"{qstat} -help",
+        "output": (out.get("output") or "")[:500],
+        "server": out.get("server"),
+        "host": out.get("host"),
+    }
 
 
 @api_router.get("/stats")
