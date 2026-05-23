@@ -177,6 +177,61 @@ export default function ServerDetail() {
     }
   };
 
+  const editPaths = async () => {
+    const lic = window.prompt(
+      "License file path on the license host (leave blank to clear):",
+      server?.license_file_path || "",
+    );
+    if (lic === null) return;
+    const opt = window.prompt(
+      "Options file path on the license host (leave blank to clear):",
+      server?.options_file_path || "",
+    );
+    if (opt === null) return;
+    try {
+      await api.updateServer(id, {
+        license_file_path: lic.trim(),
+        options_file_path: opt.trim(),
+      });
+      toast.success("Paths saved");
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Save failed");
+    }
+  };
+
+  const requestForUser = async (featureName) => {
+    const u = window.prompt(`Who is requesting "${featureName}"? (username)`, "");
+    if (!u) return;
+    try {
+      const r = await api.requestLicense({
+        server_id: id, feature: featureName, requester_user: u, seats_needed: 1,
+      });
+      if (r.action === "available") toast.success(r.message);
+      else if (r.action === "preempted")
+        toast.success(`${r.message} (priority ${r.requester_priority})`);
+      else toast.error(r.message);
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Request failed");
+    }
+  };
+
+  const syncReservations = async () => {
+    try {
+      const r = await api.syncReservationsToOptions(id);
+      if (r.pushed_to_disk)
+        toast.success(`${r.reservations_merged} reservation(s) pushed to ${r.options_path} + lmreread`);
+      else if (r.push_error)
+        toast.error(`Sync failed: ${r.push_error}`);
+      else
+        toast.warning("Saved to DB. Set options_file_path on this server to push to disk + lmreread.");
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Sync failed");
+    }
+  };
+
   const act = async (fn, msg) => {
     try {
       await fn();
@@ -198,7 +253,9 @@ export default function ServerDetail() {
   };
 
   const inUse = (featName) =>
-    checkouts.filter((c) => c.feature === featName).length;
+    checkouts
+      .filter((c) => c.feature === featName)
+      .reduce((sum, c) => sum + (c.count || 1), 0);
 
   return (
     <div className="min-h-screen bg-[#050505]" data-testid="server-detail-page">
@@ -259,6 +316,26 @@ export default function ServerDetail() {
                   last action · {server.last_action}
                 </div>
               )}
+              <div className="mt-2 font-mono text-[10px] text-[#9ca3af]">
+                <span className="text-[#6b7280]">license →</span>{" "}
+                <span className={server.license_file_path ? "text-emerald-400" : "text-amber-400"}>
+                  {server.license_file_path || "(auto-discover)"}
+                </span>
+                <br />
+                <span className="text-[#6b7280]">options →</span>{" "}
+                <span className={server.options_file_path ? "text-emerald-400" : "text-amber-400"}>
+                  {server.options_file_path || "(DB only — not pushed to lmgrd)"}
+                </span>
+                {isAdmin && (
+                  <button
+                    onClick={editPaths}
+                    className="ml-2 text-[10px] text-[#9ca3af] hover:text-white underline"
+                    data-testid="edit-paths-btn"
+                  >
+                    edit paths
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -422,8 +499,29 @@ export default function ServerDetail() {
                         {pct}%
                       </span>
                     </div>
-                    <div className="col-span-1 text-right font-mono text-[10px] uppercase tracking-wider text-[#6b7280] group-hover:text-emerald-400">
-                      DETAILS →
+                    <div className="col-span-1 text-right font-mono text-[10px] uppercase tracking-wider text-[#6b7280] group-hover:text-emerald-400 flex items-center justify-end gap-1.5">
+                      {isAdmin && pct >= 100 && (
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            requestForUser(f.name);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.stopPropagation();
+                              requestForUser(f.name);
+                            }
+                          }}
+                          className="px-1.5 py-0.5 border border-amber-700/60 text-amber-400 hover:bg-amber-900/20 cursor-pointer"
+                          data-testid={`request-${f.name}`}
+                          title="Request this license (auto-preempt if requester has higher priority)"
+                        >
+                          REQUEST
+                        </span>
+                      )}
+                      <span>DETAILS →</span>
                     </div>
                   </button>
                 );
@@ -648,14 +746,33 @@ export default function ServerDetail() {
                 <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
                   RESERVATIONS · {server.name}
                 </div>
-                <button
-                  onClick={() => setResDialogOpen(true)}
-                  className="btn-brutal primary flex items-center gap-1.5"
-                  data-testid="add-reservation-btn"
-                >
-                  <Plus size={12} /> NEW RESERVATION
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={syncReservations}
+                    className="btn-brutal flex items-center gap-1.5"
+                    data-testid="sync-reservations-btn"
+                    title="Merge reservations into options file on disk + lmreread (requires options_file_path set on this server)"
+                  >
+                    <RefreshCw size={12} /> APPLY TO LMGRD
+                  </button>
+                  <button
+                    onClick={() => setResDialogOpen(true)}
+                    className="btn-brutal primary flex items-center gap-1.5"
+                    data-testid="add-reservation-btn"
+                  >
+                    <Plus size={12} /> NEW RESERVATION
+                  </button>
+                </div>
               </div>
+              {!server.options_file_path && (
+                <div className="px-4 py-2 border-b border-amber-900/40 bg-amber-900/10 font-mono text-[10px] text-amber-400">
+                  ⚠ options_file_path is not set on this server — reservations are stored in
+                  LICMAN&apos;s database but NOT pushed to your running lmgrd&apos;s options
+                  file. Click <b>edit paths</b> above and point to{" "}
+                  <code className="text-white">/cadmgr/cadence/options.txt</code> (or wherever
+                  your file lives) to enable automatic push + lmreread.
+                </div>
+              )}
               <div className="overflow-x-auto">
                 <table className="w-full font-mono text-xs">
                   <thead className="bg-[#0a0a0a]">

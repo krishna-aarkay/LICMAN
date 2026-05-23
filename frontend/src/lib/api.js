@@ -71,6 +71,11 @@ export const api = {
   sgeGroups: () => http.get(`/sge/groups`).then((r) => r.data),
   sgeProjects: () => http.get(`/sge/projects`).then((r) => r.data),
   sgeTest: () => http.get(`/sge/test`).then((r) => r.data),
+
+  // request license (auto-preempt if needed)
+  requestLicense: (data) => http.post(`/license/request`, data).then((r) => r.data),
+  syncReservationsToOptions: (id) =>
+    http.post(`/servers/${id}/options/sync-reservations`).then((r) => r.data),
   saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
   setAdapter: (id, mode) =>
     http.put(`/servers/${id}/adapter`, { adapter_mode: mode }).then((r) => r.data),

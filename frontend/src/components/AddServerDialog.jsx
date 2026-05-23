@@ -28,6 +28,8 @@ export const AddServerDialog = ({ open, onOpenChange, onCreated }) => {
   const [host, setHost] = useState("");
   const [port, setPort] = useState(5280);
   const [daemon, setDaemon] = useState("cdslmd");
+  const [licensePath, setLicensePath] = useState("");
+  const [optionsPath, setOptionsPath] = useState("");
   const [busy, setBusy] = useState(false);
 
   const setVendorPreset = (v) => {
@@ -49,12 +51,16 @@ export const AddServerDialog = ({ open, onOpenChange, onCreated }) => {
     try {
       await api.createServer({
         name, vendor: finalVendor, host, port: Number(port), daemon,
+        license_file_path: licensePath.trim() || undefined,
+        options_file_path: optionsPath.trim() || undefined,
       });
       toast.success(`Server ${name} added`);
       onCreated?.();
       onOpenChange(false);
       setName("");
       setHost("");
+      setLicensePath("");
+      setOptionsPath("");
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Failed to add server");
     } finally {
@@ -166,6 +172,31 @@ export const AddServerDialog = ({ open, onOpenChange, onCreated }) => {
                 data-testid="add-server-daemon"
               />
             </Field>
+          </div>
+
+          <Field label="License file path (optional, on the license host)">
+            <input
+              value={licensePath}
+              onChange={(e) => setLicensePath(e.target.value)}
+              placeholder="/cadmgr/cadence/license.dat"
+              className="w-full bg-[#0a0a0a] border border-[#222] px-2 py-2 text-xs text-white"
+              data-testid="add-server-license-path"
+            />
+          </Field>
+
+          <Field label="Options file path (optional, on the license host)">
+            <input
+              value={optionsPath}
+              onChange={(e) => setOptionsPath(e.target.value)}
+              placeholder="/cadmgr/cadence/options.txt"
+              className="w-full bg-[#0a0a0a] border border-[#222] px-2 py-2 text-xs text-white"
+              data-testid="add-server-options-path"
+            />
+          </Field>
+          <div className="text-[10px] text-[#9ca3af]">
+            <span className="text-amber-400">tip ›</span> set both paths to enable
+            auto-fetch of license content and automatic push+lmreread when you edit
+            the options file or add reservations.
           </div>
         </div>
 

@@ -81,6 +81,8 @@ class LicenseServer(BaseModel):
     status: Literal["up", "down", "stale"] = "up"
     license_file: str = ""
     options_file: str = ""
+    license_file_path: str = ""  # Absolute path on the license host (e.g. /cadmgr/cadence/license.dat)
+    options_file_path: str = ""  # Absolute path on the license host (e.g. /cadmgr/cadence/options.txt)
     features: List[FeatureModel] = []
     ssh: SshConfig = Field(default_factory=SshConfig)
     adapter_mode: Literal["mock", "ssh"] = "mock"
@@ -94,6 +96,8 @@ class ServerCreate(BaseModel):
     host: str
     port: int
     daemon: str
+    license_file_path: str = ""
+    options_file_path: str = ""
 
 
 class ServerUpdate(BaseModel):
@@ -102,6 +106,8 @@ class ServerUpdate(BaseModel):
     port: Optional[int] = None
     daemon: Optional[str] = None
     status: Optional[Literal["up", "down", "stale"]] = None
+    license_file_path: Optional[str] = None
+    options_file_path: Optional[str] = None
 
 
 class FileContent(BaseModel):
@@ -119,6 +125,7 @@ class Checkout(BaseModel):
     display: str
     checkout_time: str
     pid: int
+    count: int = 1  # Number of license seats held in this single session (lmstat "N licenses")
 
 
 class Reservation(BaseModel):
@@ -210,7 +217,9 @@ def _sample_hosts():
 
 
 def generate_checkouts(server: dict):
-    """Generate plausible simulated checkouts for a server's features."""
+    """Generate plausible simulated checkouts for a server's features.
+    Occasionally produces multi-seat sessions (multi-CPU/multi-handle runs)
+    so the parser & UI can demo the new `count` field."""
     checkouts = []
     users = _sample_users()
     hosts = _sample_hosts()
@@ -218,9 +227,16 @@ def generate_checkouts(server: dict):
     if not features:
         return checkouts
     for feat in features:
-        # Random utilization 0..total+1 (allowing saturation/over occasionally)
-        in_use = random.randint(0, feat.get("total", 1))
-        for _ in range(in_use):
+        total = max(1, feat.get("total", 1))
+        in_use = random.randint(0, total)
+        seats_left = in_use
+        while seats_left > 0:
+            # 25% chance this session takes 2-4 seats (multi-CPU run)
+            roll = random.random()
+            if roll < 0.25 and seats_left >= 2:
+                grab = random.randint(2, min(4, seats_left))
+            else:
+                grab = 1
             ago = random.randint(2, 480)
             ct = datetime.now(timezone.utc) - timedelta(minutes=ago)
             checkouts.append(Checkout(
@@ -232,7 +248,9 @@ def generate_checkouts(server: dict):
                 display=f":{random.randint(0, 6)}.0",
                 checkout_time=ct.isoformat(),
                 pid=random.randint(1000, 65000),
+                count=grab,
             ).model_dump())
+            seats_left -= grab
     return checkouts
 
 
@@ -507,7 +525,8 @@ _RE_FEATURE_META = re.compile(
 # Example:  ramak edaserver1 :0.0 (v17.1) (hostname/5280 102), start Wed 5/14 9:42
 _RE_USER_LINE = re.compile(
     r"^\s+(?P<user>\S+)\s+(?P<host>\S+)\s+(?P<display>\S+)\s+"
-    r"\(v?(?P<ver>[^)]+)\)\s+\((?P<lic>\S+)\s+(?P<pid>\d+)\),\s+start\s+(?P<when>.+)$"
+    r"\(v?(?P<ver>[^)]+)\)\s+\((?P<lic>\S+)\s+(?P<pid>\d+)\),\s+start\s+(?P<when>.+?)"
+    r"(?:,\s*(?P<count>\d+)\s+licenses?)?$"
 )
 _MONTH_NAMES = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
                 "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
@@ -576,6 +595,10 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
             continue
         mu = _RE_USER_LINE.match(line)
         if mu and current_feature:
+            try:
+                count = int(mu.group("count")) if mu.group("count") else 1
+            except Exception:
+                count = 1
             checkouts.append({
                 "id": str(uuid.uuid4()),
                 "server_id": server_id,
@@ -586,6 +609,7 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
                 "display": mu.group("display"),
                 "pid": int(mu.group("pid")),
                 "checkout_time": _parse_start_to_iso(mu.group("when")),
+                "count": count,
             })
     return {
         "features": [
@@ -1297,16 +1321,107 @@ async def save_license_file(server_id: str, payload: FileContent):
 
 
 @api_router.put("/servers/{server_id}/options")
-async def save_options_file(server_id: str, payload: FileContent):
+async def save_options_file(server_id: str, payload: FileContent,
+                             push_to_disk: bool = True, reread: bool = True):
+    """Save options file. If the server has options_file_path set and SSH enabled,
+    also push the content to that path on the remote host and trigger lmreread so
+    the running daemon picks up the changes."""
     res = await db.servers.find_one_and_update(
         {"id": server_id}, {"$set": {"options_file": payload.content}},
         return_document=True, projection={"_id": 0}
     )
     if not res:
         raise HTTPException(404, "Server not found")
-    await log_audit("OPTIONS_SAVE", f"Options file saved for {res['name']}",
-                    server_id, res["name"], "success")
-    return {"ok": True}
+    pushed = False
+    push_error = None
+    rereaded = False
+    opts_path = (res.get("options_file_path") or "").strip()
+    ssh = res.get("ssh", {}) or {}
+    is_ssh = res.get("adapter_mode") == "ssh" and ssh.get("enabled") and PARAMIKO_AVAILABLE
+    if push_to_disk and is_ssh and opts_path:
+        # Stream the content via stdin to avoid escaping nightmares; use cat > path
+        import base64
+        b64 = base64.b64encode(payload.content.encode("utf-8")).decode("ascii")
+        cmd = (
+            f"echo {_shlex.quote(b64)} | base64 -d > {_shlex.quote(opts_path)} "
+            f"&& echo PUSHED_OK || echo PUSH_FAILED"
+        )
+        push_res = await asyncio.to_thread(_ssh_real_exec, _ssh_with_decrypted(ssh), cmd)
+        pushed = "PUSHED_OK" in (push_res.get("output") or "")
+        if not pushed:
+            push_error = (push_res.get("output") or "")[:300] or "unknown error"
+        if pushed and reread:
+            lmutil = (ssh.get("lmutil_path") or "lmutil").strip()
+            target = f"{res['port']}@{res['host']}"
+            daemon = (res.get("daemon") or "").strip()
+            r_cmd = f"{_shlex.quote(lmutil)} lmreread -c {_shlex.quote(target)}"
+            if daemon:
+                r_cmd += f" -vendor {_shlex.quote(daemon)}"
+            rr = await asyncio.to_thread(_ssh_real_exec, _ssh_with_decrypted(ssh), r_cmd)
+            rereaded = rr.get("exit") == 0
+    await log_audit(
+        "OPTIONS_SAVE",
+        f"Options saved for {res['name']} · pushed={pushed} reread={rereaded} "
+        f"path={opts_path or '(db only)'}{' · ERR:' + push_error if push_error else ''}",
+        server_id, res["name"], "warning" if push_error else "success",
+    )
+    return {
+        "ok": True, "pushed_to_disk": pushed, "lmreread": rereaded,
+        "options_path": opts_path, "push_error": push_error,
+        "stored_in_db": True,
+    }
+
+
+@api_router.post("/servers/{server_id}/options/sync-reservations")
+async def sync_reservations_to_options(server_id: str, _: dict = Depends(require_admin)):
+    """Merge all reservations stored in MongoDB into the options file content
+    as `RESERVE <count> <feature> <TYPE> <target>` directives, then push to disk
+    and lmreread. This is what makes the Reservations tab actually take effect
+    on the running daemon."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    reservations = await db.reservations.find(
+        {"server_id": server_id}, {"_id": 0}
+    ).to_list(500)
+    existing = doc.get("options_file", "") or ""
+    # Strip out previously-generated RESERVE block (marked by sentinel) so we don't duplicate
+    SENTINEL_START = "# --- LICMAN MANAGED RESERVATIONS START ---"
+    SENTINEL_END = "# --- LICMAN MANAGED RESERVATIONS END ---"
+    lines = existing.splitlines()
+    kept = []
+    skipping = False
+    for ln in lines:
+        if ln.strip() == SENTINEL_START:
+            skipping = True
+            continue
+        if ln.strip() == SENTINEL_END:
+            skipping = False
+            continue
+        if not skipping:
+            kept.append(ln)
+    # Trim trailing blank lines
+    while kept and not kept[-1].strip():
+        kept.pop()
+    # Append fresh RESERVE block
+    new_block = [SENTINEL_START]
+    new_block.append(f"# {len(reservations)} reservation(s) — auto-generated by LICMAN")
+    new_block.append(f"# Last sync: {datetime.now(timezone.utc).isoformat()}")
+    for r in reservations:
+        new_block.append(
+            f"RESERVE {r.get('count', 1)} {r['feature']} {r['target_type']} {r['target']}"
+        )
+    new_block.append(SENTINEL_END)
+    new_content = "\n".join(kept + [""] + new_block) + "\n"
+    # Reuse save endpoint logic
+    save_res = await save_options_file(
+        server_id, FileContent(content=new_content), push_to_disk=True, reread=True
+    )
+    return {
+        **save_res,
+        "reservations_merged": len(reservations),
+        "options_content_preview": new_content[-800:],
+    }
 
 
 @api_router.post("/servers/{server_id}/reread")
@@ -1632,7 +1747,8 @@ async def fetch_license(server_id: str, path: Optional[str] = None, _: dict = De
         raise HTTPException(400, "SSH adapter not enabled on this server")
     ssh_decrypted = _ssh_with_decrypted(ssh)
     lmutil = (ssh.get("lmutil_path") or "lmutil").strip()
-    lic_path = (path or "").strip()
+    # Priority: explicit ?path= → server.license_file_path → auto-discover via lmdiag
+    lic_path = (path or doc.get("license_file_path") or "").strip()
     if not lic_path:
         target = f"{doc['port']}@{doc['host']}"
         discover_cmd = (
@@ -1644,8 +1760,9 @@ async def fetch_license(server_id: str, path: Optional[str] = None, _: dict = De
         if not lic_path:
             raise HTTPException(
                 404,
-                "Could not auto-discover license file path on remote host. "
-                "Call this endpoint again with ?path=/full/path/to/license.dat",
+                "Could not auto-discover the license file path. "
+                "Set 'license_file_path' on this server (Dashboard → server card → edit), "
+                "or call this endpoint with ?path=/full/path/to/license.dat",
             )
     res = await asyncio.to_thread(
         _ssh_real_exec, ssh_decrypted, f"cat {_shlex.quote(lic_path)}"
@@ -1653,7 +1770,10 @@ async def fetch_license(server_id: str, path: Optional[str] = None, _: dict = De
     if res.get("exit") != 0 or not res.get("output"):
         raise HTTPException(502, f"Failed to read remote license file: {(res.get('output') or '')[:300]}")
     content = res["output"]
-    await db.servers.update_one({"id": server_id}, {"$set": {"license_file": content}})
+    await db.servers.update_one(
+        {"id": server_id},
+        {"$set": {"license_file": content, "license_file_path": lic_path}},
+    )
     await log_audit("LICENSE_FETCH",
                     f"Fetched license from {ssh.get('host')}:{lic_path} ({len(content)} bytes)",
                     server_id, doc["name"], "success")
@@ -1988,33 +2108,56 @@ async def list_reservations(server_id: Optional[str] = None):
 
 
 @api_router.post("/reservations", response_model=Reservation)
-async def create_reservation(payload: ReservationCreate):
+async def create_reservation(payload: ReservationCreate, auto_apply: bool = True):
     srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0})
     if not srv:
         raise HTTPException(404, "Server not found")
     r = Reservation(**payload.model_dump())
     await db.reservations.insert_one(r.model_dump())
+    applied = False
+    if auto_apply and (srv.get("options_file_path") or "").strip() \
+            and srv.get("adapter_mode") == "ssh" \
+            and (srv.get("ssh") or {}).get("enabled"):
+        try:
+            await sync_reservations_to_options(payload.server_id, {"role": "admin"})  # type: ignore
+            applied = True
+        except Exception as e:
+            logger.warning(f"reservation auto-apply failed: {e}")
     await log_audit(
         "RESERVE",
-        f"RESERVE {r.count} {r.feature} {r.target_type} {r.target} on {srv['name']}",
+        f"RESERVE {r.count} {r.feature} {r.target_type} {r.target} on {srv['name']} "
+        f"(applied={applied})",
         srv["id"], srv["name"], "info",
     )
     return r
 
 
 @api_router.delete("/reservations/{rid}")
-async def delete_reservation(rid: str):
+async def delete_reservation(rid: str, auto_apply: bool = True):
     doc = await db.reservations.find_one({"id": rid}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Reservation not found")
     await db.reservations.delete_one({"id": rid})
-    srv = await db.servers.find_one({"id": doc["server_id"]}, {"_id": 0, "name": 1})
+    srv = await db.servers.find_one({"id": doc["server_id"]}, {"_id": 0})
+    applied = False
+    if (
+        auto_apply and srv
+        and (srv.get("options_file_path") or "").strip()
+        and srv.get("adapter_mode") == "ssh"
+        and (srv.get("ssh") or {}).get("enabled")
+    ):
+        try:
+            await sync_reservations_to_options(doc["server_id"], {"role": "admin"})  # type: ignore
+            applied = True
+        except Exception as e:
+            logger.warning(f"reservation auto-apply failed: {e}")
     await log_audit(
         "UNRESERVE",
-        f"Removed RESERVE {doc['feature']} {doc['target_type']} {doc['target']}",
+        f"Removed RESERVE {doc['feature']} {doc['target_type']} {doc['target']} "
+        f"(applied={applied})",
         doc["server_id"], srv["name"] if srv else None, "info",
     )
-    return {"ok": True}
+    return {"ok": True, "applied_to_options": applied}
 
 
 @api_router.get("/audit", response_model=List[AuditLog])
@@ -2437,6 +2580,80 @@ async def preempt_who_am_i(user: str = "", group: str = "", project: str = "",
     prio = await _resolve_priority(user, group, project, feature)
     return {"user": user, "group": group, "project": project,
             "feature": feature, "priority": prio}
+
+
+class RequestLicensePayload(BaseModel):
+    server_id: str
+    feature: str
+    requester_user: str = ""
+    requester_group: str = ""
+    requester_project: str = ""
+    seats_needed: int = 1
+    auto_preempt: bool = True
+
+
+@api_router.post("/license/request")
+async def request_license(payload: RequestLicensePayload, _: dict = Depends(require_admin)):
+    """Workflow when a high-priority user wants a license:
+      1. If feature is available → return ok=true, suggestion="check it out normally"
+      2. If saturated and the requester's priority > some current holder's priority →
+         auto-preempt the lowest holder(s) and return ok=true, preempted=N
+      3. If saturated and requester is NOT high enough → return ok=false, reason
+    """
+    srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0})
+    if not srv:
+        raise HTTPException(404, "Server not found")
+    feat = next((f for f in (srv.get("features") or []) if f["name"] == payload.feature), None)
+    if not feat:
+        raise HTTPException(404, f"Feature '{payload.feature}' not found on {srv['name']}")
+    holders = await db.checkouts.find(
+        {"server_id": payload.server_id, "feature": payload.feature}, {"_id": 0}
+    ).to_list(500)
+    seats_used = sum(int(h.get("count") or 1) for h in holders)
+    seats_total = int(feat.get("total") or 0)
+    seats_free = max(0, seats_total - seats_used)
+    if seats_free >= payload.seats_needed:
+        return {
+            "ok": True, "action": "available",
+            "seats_free": seats_free,
+            "message": f"{seats_free} seat(s) free — '{payload.requester_user or 'requester'}' can check out normally.",
+        }
+    # Saturated → try preemption
+    if not payload.auto_preempt:
+        return {
+            "ok": False, "action": "blocked",
+            "seats_free": seats_free,
+            "message": "Feature saturated and auto_preempt=false. Run /api/preempt/plan to preview.",
+        }
+    pp = PreemptPayload(
+        server_id=payload.server_id, feature=payload.feature,
+        requester_user=payload.requester_user,
+        requester_group=payload.requester_group,
+        requester_project=payload.requester_project,
+        seats_needed=payload.seats_needed - seats_free,
+    )
+    plan = await preempt_plan(pp, _)
+    if not plan["can_satisfy"]:
+        return {
+            "ok": False, "action": "denied_low_priority",
+            "seats_free": seats_free,
+            "requester_priority": plan["requester_priority"],
+            "message": (
+                f"Saturated and requester priority {plan['requester_priority']} is not high enough "
+                f"to displace any current holder. Try increasing the rule priority."
+            ),
+        }
+    run_res = await preempt_run(pp, _)
+    return {
+        "ok": True, "action": "preempted",
+        "seats_freed": len(run_res.get("actions") or []),
+        "requester_priority": plan["requester_priority"],
+        "preempt_result": run_res,
+        "message": (
+            f"Preempted {len(run_res.get('actions') or [])} holder(s) — "
+            f"'{payload.requester_user or 'requester'}' can now check out."
+        ),
+    }
 
 
 # ---------- SGE auto-discovery ----------
