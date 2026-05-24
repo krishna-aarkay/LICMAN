@@ -252,10 +252,21 @@ export default function ServerDetail() {
     }
   };
 
-  const inUse = (featName) =>
-    checkouts
+  // sum of count field across active checkouts + count of reservations
+  // OR the server-reported `in use` count from lmstat header — whichever is HIGHER.
+  // Real lmstat sometimes folds multi-seat checkouts into a single user row but
+  // still reports the correct total in the feature header. The reservation count
+  // is added because RESERVE seats are consumed even when no one is using them.
+  const inUse = (featName) => {
+    const fromCheckouts = checkouts
       .filter((c) => c.feature === featName)
       .reduce((sum, c) => sum + (c.count || 1), 0);
+    const fromReservations = reservations
+      .filter((r) => r.feature === featName)
+      .reduce((sum, r) => sum + (r.count || 1), 0);
+    const reported = (server?.features || []).find((f) => f.name === featName)?.in_use_reported || 0;
+    return Math.max(fromCheckouts + fromReservations, reported);
+  };
 
   return (
     <div className="min-h-screen bg-[#050505]" data-testid="server-detail-page">
@@ -857,7 +868,12 @@ export default function ServerDetail() {
 
 const FeatureDetailModal = ({ feature, server, checkouts, reservations, onClose, onKill, killing, canKill }) => {
   if (!feature) return null;
-  const used = checkouts.length;
+  // Same calculation as the row: sum multi-seat checkouts + reserved seats,
+  // and take the max against lmstat's authoritative `in use` reading.
+  const sumCheckouts = checkouts.reduce((s, c) => s + (c.count || 1), 0);
+  const sumReservations = reservations.reduce((s, r) => s + (r.count || 1), 0);
+  const reported = feature.in_use_reported || 0;
+  const used = Math.max(sumCheckouts + sumReservations, reported);
   const pct = Math.min(100, Math.round((used / Math.max(1, feature.total)) * 100));
   const color = pct > 80 ? "#ef4444" : pct > 50 ? "#f59e0b" : "#10b981";
   return (
@@ -898,6 +914,10 @@ const FeatureDetailModal = ({ feature, server, checkouts, reservations, onClose,
             <div className="text-[10px] uppercase tracking-wider text-[#6b7280]">IN USE</div>
             <div className="text-2xl font-bold tabular-nums mt-1" style={{ color }}>
               {used}
+            </div>
+            <div className="text-[9px] text-[#6b7280] mt-1 uppercase tracking-wider">
+              {sumCheckouts} active · {sumReservations} reserved
+              {reported > sumCheckouts + sumReservations && ` · ${reported} reported`}
             </div>
           </div>
           <div>

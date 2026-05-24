@@ -52,11 +52,25 @@ public_router = APIRouter(prefix="/api")
 Vendor = str
 
 
+class FeatureIncrement(BaseModel):
+    """One INCREMENT/FEATURE line from the license file. A single feature can
+    have several increments with different expiry dates and seat counts."""
+    version: str = "1.0"
+    expires: str = "permanent"
+    count: int = 0
+
+
 class FeatureModel(BaseModel):
     name: str
     version: str = "1.0"
     total: int = 1
     expires: str = "permanent"
+    # Authoritative `in use` count reported by lmstat header ("Total of N licenses in use").
+    # Some FlexLM checkout lines are folded into a single line per user, so the
+    # user-line count alone undercounts the real seats held. We use this field
+    # as the upper bound for utilization display.
+    in_use_reported: int = 0
+    increments: List[FeatureIncrement] = []
 
 
 class SshConfig(BaseModel):
@@ -571,7 +585,9 @@ def _parse_start_to_iso(when: str) -> str:
 
 
 def parse_lmstat_a(text: str, server_id: str) -> dict:
-    """Return dict {features: [...], checkouts: [...]} parsed from `lmstat -a` output."""
+    """Return dict {features: [...], checkouts: [...]} parsed from `lmstat -a` output.
+    Captures both the server-reported `in use` count (authoritative) and individual
+    user-line checkouts. Also gathers ALL increment expiry lines per feature."""
     features: dict = {}
     checkouts: list = []
     current_feature = None
@@ -584,17 +600,28 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
             features[current_feature] = {
                 "name": current_feature,
                 "total": int(m.group("total")),
-                "in_use": int(m.group("inuse")),
+                "in_use_reported": int(m.group("inuse")),
                 "version": "",
                 "expires": "permanent",
+                "increments": [],  # All INCREMENT/feature-meta lines for this feature
             }
-            # Sometimes the meta line follows after a blank line
-            for j in range(i + 1, min(i + 4, len(lines))):
+            # Scan forward until the next `Users of` line, collecting every
+            # FEATURE_META line that belongs to this feature.
+            for j in range(i + 1, len(lines)):
+                if _RE_USERS_OF.match(lines[j]):
+                    break
                 mm = _RE_FEATURE_META.match(lines[j])
                 if mm and mm.group("feature") == current_feature:
-                    features[current_feature]["version"] = mm.group("version")
-                    features[current_feature]["expires"] = mm.group("expires") or "permanent"
-                    break
+                    if not features[current_feature]["version"]:
+                        features[current_feature]["version"] = mm.group("version")
+                    if not features[current_feature]["expires"] or \
+                            features[current_feature]["expires"] == "permanent":
+                        features[current_feature]["expires"] = mm.group("expires") or "permanent"
+                    features[current_feature]["increments"].append({
+                        "version": mm.group("version"),
+                        "expires": mm.group("expires") or "permanent",
+                        "count": 0,  # filled by license-file parser if available
+                    })
             continue
         mu = _RE_USER_LINE.match(line)
         if mu and current_feature:
@@ -616,12 +643,53 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
             })
     return {
         "features": [
-            {"name": f["name"], "version": f.get("version") or "1.0",
-             "total": f["total"], "expires": f.get("expires") or "permanent"}
+            {
+                "name": f["name"],
+                "version": f.get("version") or "1.0",
+                "total": f["total"],
+                "in_use_reported": f.get("in_use_reported", 0),
+                "expires": f.get("expires") or "permanent",
+                "increments": f.get("increments") or [],
+            }
             for f in features.values()
         ],
         "checkouts": checkouts,
     }
+
+
+# ---------- License-file INCREMENT parser ----------
+
+# INCREMENT <feature> <daemon> <version> <date> <count> [...]
+_RE_INCREMENT = re.compile(
+    r"^\s*(?:INCREMENT|FEATURE)\s+(?P<feature>\S+)\s+(?P<daemon>\S+)\s+"
+    r"(?P<version>\S+)\s+(?P<expires>\S+)\s+(?P<count>uncounted|\d+)",
+    re.IGNORECASE,
+)
+
+
+def parse_license_file_increments(content: str) -> dict:
+    """Walk every INCREMENT/FEATURE line in a .lic/.dat file and return
+    {feature_name: [{version, expires, count}, ...]}. Multiple increments per
+    feature (different expiry dates with separate seat counts) are preserved
+    so the Expiry calendar shows each tranche separately."""
+    out: dict = {}
+    for raw in (content or "").splitlines():
+        line = raw.rstrip("\\").strip()  # FlexLM may use \ for line continuation
+        m = _RE_INCREMENT.match(line)
+        if not m:
+            continue
+        feat = m.group("feature")
+        count_raw = m.group("count")
+        try:
+            count = 0 if count_raw.lower() == "uncounted" else int(count_raw)
+        except Exception:
+            count = 0
+        out.setdefault(feat, []).append({
+            "version": m.group("version"),
+            "expires": m.group("expires"),
+            "count": count,
+        })
+    return out
 
 
 async def _real_checkouts_via_ssh(server: dict) -> Optional[dict]:
@@ -645,7 +713,15 @@ async def gather_checkouts(server: dict) -> list:
     if mode == "ssh":
         parsed = await _real_checkouts_via_ssh(server)
         if parsed is not None:
-            # Persist parsed features if any new ones discovered
+            # Merge license-file INCREMENT counts into each feature so the
+            # Expiry calendar shows separate rows per tranche.
+            lic_content = server.get("license_file") or ""
+            inc_map = parse_license_file_increments(lic_content) if lic_content else {}
+            for feat in parsed["features"]:
+                inc_from_file = inc_map.get(feat["name"]) or []
+                if inc_from_file:
+                    # Prefer file data — it's the source of truth for per-tranche counts
+                    feat["increments"] = inc_from_file
             if parsed["features"]:
                 await db.servers.update_one(
                     {"id": server["id"]}, {"$set": {"features": parsed["features"]}}
@@ -1946,30 +2022,45 @@ async def validate_options(server_id: str, payload: OptionsValidatePayload):
 
 @api_router.get("/expiry")
 async def expiry_calendar(warn_days: int = 90):
+    """One row per INCREMENT tranche. A feature with seats split across multiple
+    INCREMENT lines (e.g. 1 seat exp 26-may + 2 seats exp 29-may) emits TWO
+    rows so the calendar reflects the staggered renewal schedule, not just the
+    last expiry date."""
     servers = await db.servers.find({}, {"_id": 0}).to_list(500)
     rows = []
     for s in servers:
         for f in s.get("features", []):
-            d = parse_expiry(f.get("expires", ""))
-            days = days_until(d)
-            rows.append({
-                "server_id": s["id"],
-                "server_name": s["name"],
-                "vendor": s["vendor"],
-                "feature": f["name"],
-                "version": f.get("version"),
-                "total": f.get("total"),
-                "expires": f.get("expires"),
-                "expires_iso": d.isoformat() if d else None,
-                "days_remaining": days,
-                "status": (
-                    "permanent" if days is None
-                    else "expired" if days < 0
-                    else "critical" if days <= 30
-                    else "warning" if days <= warn_days
-                    else "ok"
-                ),
-            })
+            increments = f.get("increments") or []
+            # Backfill from `expires` so legacy features (no increments parsed) still
+            # produce exactly one row.
+            if not increments:
+                increments = [{
+                    "version": f.get("version"),
+                    "expires": f.get("expires", ""),
+                    "count": f.get("total") or 0,
+                }]
+            for inc in increments:
+                expires_str = inc.get("expires") or ""
+                d = parse_expiry(expires_str)
+                days = days_until(d)
+                rows.append({
+                    "server_id": s["id"],
+                    "server_name": s["name"],
+                    "vendor": s["vendor"],
+                    "feature": f["name"],
+                    "version": inc.get("version") or f.get("version"),
+                    "total": inc.get("count") or f.get("total"),
+                    "expires": expires_str or "permanent",
+                    "expires_iso": d.isoformat() if d else None,
+                    "days_remaining": days,
+                    "status": (
+                        "permanent" if days is None
+                        else "expired" if days < 0
+                        else "critical" if days <= 30
+                        else "warning" if days <= warn_days
+                        else "ok"
+                    ),
+                })
     # Sort: expired first, then nearest expiry, permanent at end
     def sk(r):
         if r["days_remaining"] is None:
