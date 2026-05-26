@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Zap, Plus, Trash2, Save, AlertTriangle, Crown, Edit3, Database, RefreshCw, Hourglass, X } from "lucide-react";
+import { Zap, Plus, Trash2, Save, AlertTriangle, Crown, Edit3, Database, RefreshCw, Hourglass, X, Activity, PlayCircle } from "lucide-react";
 import { api } from "@/lib/api";
 import Header from "@/components/Header";
 import { toast } from "sonner";
@@ -46,6 +46,40 @@ export default function Priority() {
   const [reqSeats, setReqSeats] = useState(1);
   const [reqServer, setReqServer] = useState("");
   const [submittingReq, setSubmittingReq] = useState(false);
+
+  // Auto-preempt monitor (status + on-demand tick)
+  const [autoStatus, setAutoStatus] = useState(null);
+  const [tickRunning, setTickRunning] = useState(false);
+  const [tickResult, setTickResult] = useState(null);
+
+  const loadAutoStatus = async () => {
+    try {
+      const s = await api.preemptAutoStatus();
+      setAutoStatus(s);
+    } catch {
+      /* silent */
+    }
+  };
+
+  const runTickNow = async () => {
+    setTickRunning(true);
+    try {
+      const r = await api.preemptAutoTick();
+      setTickResult(r);
+      if (r.actioned > 0) {
+        toast.success(`Preempted ${r.actioned} seat(s) — see RESULTS below`);
+      } else if ((r.reasons || []).length > 0) {
+        toast.info(`No action — ${r.reasons.length} skip reason(s) recorded`);
+      } else {
+        toast.info("No rules scanned (no enabled rules?)");
+      }
+      await loadPending();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Auto-tick failed");
+    } finally {
+      setTickRunning(false);
+    }
+  };
 
   const loadPending = async () => {
     try {
@@ -116,7 +150,8 @@ export default function Priority() {
   useEffect(() => {
     load();
     loadPending();
-    const t = setInterval(loadPending, 10000);
+    loadAutoStatus();
+    const t = setInterval(() => { loadPending(); loadAutoStatus(); }, 10000);
     return () => clearInterval(t);
   }, []);
 
@@ -445,6 +480,115 @@ export default function Priority() {
             </div>
           </section>
         )}
+
+        {/* Auto-Preempt Monitor */}
+        <section className="bg-[#111] border border-[#222] rounded-sm" data-testid="auto-preempt-monitor">
+          <div className="px-4 py-3 border-b border-[#222] flex items-center gap-2">
+            <Activity size={14} className="text-cyan-400" />
+            <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
+              AUTO-PREEMPT MONITOR
+            </div>
+            <span className="font-mono text-[11px] text-[#6b7280]">
+              · rule-driven · wildcard / group / project patterns supported · runs without SGE
+            </span>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                onClick={loadAutoStatus}
+                className="btn-brutal flex items-center gap-1.5"
+                data-testid="reload-auto-status"
+                title="Refresh status"
+              >
+                <RefreshCw size={11} />
+              </button>
+              <button
+                onClick={runTickNow}
+                disabled={tickRunning}
+                className="btn-brutal primary flex items-center gap-1.5 disabled:opacity-50"
+                data-testid="run-auto-tick"
+              >
+                <PlayCircle size={12} /> {tickRunning ? "TICKING…" : "RUN TICK NOW"}
+              </button>
+            </div>
+          </div>
+          <div className="px-4 py-3 grid grid-cols-2 md:grid-cols-5 gap-3 font-mono text-[11px] border-b border-[#1a1a1a]">
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-[#6b7280]">Daemon</div>
+              <div className={autoStatus?.running ? "text-emerald-400" : "text-red-400"}>
+                {autoStatus?.running ? "RUNNING" : "STOPPED"}
+              </div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-[#6b7280]">Toggle (Settings)</div>
+              <div className={autoStatus?.enabled_in_settings ? "text-emerald-400" : "text-amber-400"}>
+                {autoStatus?.enabled_in_settings ? "ENABLED" : "DISABLED"}
+              </div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-[#6b7280]">Interval</div>
+              <div className="text-white tabular-nums">{autoStatus?.interval_sec ?? "—"}s</div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-[#6b7280]">Mode</div>
+              <div className="text-white">{autoStatus?.mode || "—"}</div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-[#6b7280]">Last manual tick</div>
+              <div className="text-white">
+                {tickResult ? `${tickResult.actioned}/${tickResult.scanned_rules} rule(s) actioned` : "—"}
+              </div>
+            </div>
+          </div>
+          {tickResult && (
+            <div className="px-4 py-3 grid grid-cols-1 md:grid-cols-2 gap-4 font-mono text-[11px]">
+              <div>
+                <div className="text-[9px] uppercase tracking-[0.2em] text-emerald-400 mb-1.5">
+                  RESULTS ({(tickResult.results || []).length})
+                </div>
+                {(tickResult.results || []).length === 0 && (
+                  <div className="text-[#6b7280] italic">// no preemption actions this tick</div>
+                )}
+                <div className="max-h-60 overflow-y-auto space-y-1">
+                  {(tickResult.results || []).map((r, i) => (
+                    <div key={i} className="border border-[#1a1a1a] px-2 py-1.5 bg-[#0a0a0a]">
+                      <div className="text-emerald-400 text-[10px] uppercase">{r.outcome || "—"}</div>
+                      <div className="text-white">{r.rule || r.user} → {r.feature}</div>
+                      {r.preempted_user && (
+                        <div className="text-[#9ca3af]">
+                          preempted: <span className="text-red-400">{r.preempted_user}@{r.preempted_host}</span>
+                          {" "}(prio={r.preempted_priority})
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-[9px] uppercase tracking-[0.2em] text-amber-400 mb-1.5">
+                  SKIP REASONS ({(tickResult.reasons || []).length})
+                </div>
+                {(tickResult.reasons || []).length === 0 && (
+                  <div className="text-[#6b7280] italic">// no skips — all rules either preempted or had no holders</div>
+                )}
+                <div className="max-h-60 overflow-y-auto space-y-1">
+                  {(tickResult.reasons || []).map((r, i) => (
+                    <div key={i} className="border border-[#1a1a1a] px-2 py-1.5 bg-[#0a0a0a]">
+                      <div className="text-amber-400 text-[10px] uppercase">{r.skip}</div>
+                      <div className="text-white">{r.rule} → {r.feature}</div>
+                      {r.used != null && (
+                        <div className="text-[#9ca3af]">used={r.used}/total={r.total}</div>
+                      )}
+                      {r.holder_priorities && (
+                        <div className="text-[#9ca3af]">
+                          rule_prio={r.rule_priority} vs holder_prios=[{r.holder_priorities.join(", ")}]
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
 
         {/* Pending requests queue */}
         <section className="bg-[#111] border border-[#222] rounded-sm" data-testid="pending-requests-panel">

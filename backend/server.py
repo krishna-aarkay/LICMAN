@@ -3251,21 +3251,17 @@ async def _find_server_for_feature(feature: str) -> Optional[dict]:
 
 
 async def _heuristic_preempt_candidates() -> List[dict]:
-    """SGE-free fallback. Two signal sources, merged:
+    """SGE-free fallback. Explicit signal source only — the pending_requests
+    queue (admins/engineers explicitly ask "ramkella needs Innovus").
 
-    1. **Pending requests queue** (`db.pending_requests`) — admins / engineers
-       explicitly ask: "ramkella needs Innovus". This is the cleanest signal
-       when you don't have a job scheduler.
-    2. **Priority-rule heuristic** — every active rule with a literal username
-       is treated as "this user wants these features" so the loop preempts
-       proactively even before someone clicks REQUEST.
+    The rule-driven proactive preemption is handled separately by
+    `_rule_driven_preempt_pass` because rules can use wildcards / groups /
+    projects and don't need a synthesized requester user.
     """
-    # 1) Explicit pending requests — drain & retry
     pending = await db.pending_requests.find(
         {"state": "open"}, {"_id": 0}
     ).sort("created_at", 1).to_list(500)
     out: List[dict] = []
-    seen: set = set()
     for p in pending:
         # Skip aged-out requests (> 1h) — they probably gave up
         try:
@@ -3283,52 +3279,173 @@ async def _heuristic_preempt_candidates() -> List[dict]:
             "feature": p["feature"], "seats": int(p.get("seats") or 1),
             "_request_id": p["id"],
         })
-        seen.add(("req", p["id"]))
+    return out
 
-    # 2) Priority-rule heuristic — only triggers if the user matches a literal
-    #    pattern AND the feature is saturated AND they don't already hold a seat.
+
+async def _rule_driven_preempt_pass(fake_admin: dict) -> dict:
+    """Proactive preemption driven by priority rules alone — no SGE, no UI
+    click required. For each enabled rule, for each saturated feature in
+    the rule (or all features if rule.features is empty), preempt the
+    lowest-priority holder if at least one holder has strictly lower
+    priority than the rule. Works with wildcard / group / project patterns
+    because no synthetic requester user is needed — the rule's own
+    priority is the requester-priority.
+
+    Idempotency:
+    - Skips the feature if a holder already matches the rule's pattern
+      (high-priority user already has a seat → nothing to free for them)
+    - Skips if all holders are at or above the rule's priority
+    - Frees AT MOST ONE seat per (rule, feature) per tick to avoid runaway
+      kills when many low-priority holders exist
+    """
     rules = await db.priority_rules.find(
         {"enabled": True}, {"_id": 0}
     ).sort("priority", -1).to_list(500)
+    if not rules:
+        return {"scanned_rules": 0, "actioned": 0, "results": [], "reasons": []}
+
+    actioned = 0
+    results: List[dict] = []
+    reasons: List[dict] = []
+    # Track (server_id, feature) we already freed this tick so two rules
+    # don't double-preempt the same feature in one sweep.
+    freed_this_tick: set = set()
+
     for r in rules:
+        rule_name = r.get("name") or r.get("id")
+        rule_prio = int(r.get("priority", 0))
+        u_pat = (r.get("user_pattern") or "").strip()
+        g_pat = (r.get("group_pattern") or "").strip()
+        p_pat = (r.get("project_pattern") or "").strip()
         feats = r.get("features") or []
-        if not feats:
-            continue
-        pat = (r.get("user_pattern") or "").strip()
-        if not pat or any(ch in pat for ch in "*?["):
-            continue
-        for fname in feats:
-            srv = await _find_server_for_feature(fname)
-            if not srv:
+
+        # Build the target (server, feature) list
+        target_features: List[tuple] = []
+        if feats:
+            for fname in feats:
+                srv = await _find_server_for_feature(fname)
+                if srv:
+                    target_features.append((srv, fname))
+                else:
+                    reasons.append({"rule": rule_name, "feature": fname,
+                                    "skip": "no_server_hosts_feature"})
+        else:
+            # Empty features list = rule applies to ALL features fleet-wide
+            servers = await db.servers.find({}, {"_id": 0}).to_list(200)
+            for srv in servers:
+                for ft in (srv.get("features") or []):
+                    target_features.append((srv, ft["name"]))
+
+        for srv, fname in target_features:
+            if (srv["id"], fname) in freed_this_tick:
                 continue
-            feat = next((f for f in srv["features"] if f["name"] == fname), None)
+            feat = next((f for f in (srv.get("features") or [])
+                         if f["name"] == fname), None)
             if not feat:
                 continue
             holders = await db.checkouts.find(
                 {"server_id": srv["id"], "feature": fname}, {"_id": 0}
             ).to_list(500)
-            used = sum(int(h.get("count") or 1) for h in holders)
-            if used < int(feat.get("total") or 0):
-                continue  # Free seats — no preemption needed
-            if any(h.get("user", "").lower() == pat.lower() for h in holders):
+            seats_used = sum(int(h.get("count") or 1) for h in holders)
+            seats_total = int(feat.get("total") or 0)
+            if seats_total <= 0:
                 continue
-            key = (srv["id"], fname, pat)
-            if key in seen:
+            if seats_used < seats_total:
+                reasons.append({"rule": rule_name, "feature": fname,
+                                "server": srv["name"], "skip": "not_saturated",
+                                "used": seats_used, "total": seats_total})
                 continue
-            seen.add(key)
-            out.append({
-                "jobid": f"rule:{r['id']}", "user": pat, "project": "",
-                "feature": fname, "seats": 1,
-            })
-    return out
+            # If a holder already matches the rule's pattern, the rule is
+            # already "satisfied" — no need to free another seat.
+            already_holding = any(
+                (u_pat and _match_pattern(u_pat, h.get("user", ""))) or
+                (g_pat and _match_pattern(g_pat, h.get("group", ""))) or
+                (p_pat and _match_pattern(p_pat, h.get("project", "")))
+                for h in holders
+            )
+            if already_holding:
+                reasons.append({"rule": rule_name, "feature": fname,
+                                "server": srv["name"],
+                                "skip": "matching_user_already_holds_seat"})
+                continue
+
+            # Find the lowest-priority preemptible holder
+            enriched = []
+            for h in holders:
+                hp = await _resolve_priority(h.get("user", ""), "", "", fname)
+                enriched.append((hp, h))
+            enriched.sort(key=lambda x: (x[0], x[1].get("checkout_time", "")))
+            target = next(((hp, h) for (hp, h) in enriched if hp < rule_prio), None)
+            if not target:
+                reasons.append({"rule": rule_name, "feature": fname,
+                                "server": srv["name"],
+                                "skip": "all_holders_>=_rule_priority",
+                                "rule_priority": rule_prio,
+                                "holder_priorities": [hp for hp, _ in enriched]})
+                continue
+
+            holder_prio, h = target
+            kill_payload = KillCheckoutPayload(
+                feature=fname, user=h.get("user", ""),
+                host=h.get("host", ""), display=h.get("display", "") or "",
+            )
+            try:
+                kr = await kill_checkout(srv["id"], kill_payload, fake_admin)
+                actioned += 1
+                freed_this_tick.add((srv["id"], fname))
+                results.append({
+                    "rule": rule_name, "rule_priority": rule_prio,
+                    "pattern": u_pat or g_pat or p_pat or "(all)",
+                    "server": srv["name"], "feature": fname,
+                    "preempted_user": h.get("user"),
+                    "preempted_host": h.get("host"),
+                    "preempted_priority": holder_prio,
+                    "outcome": "preempted",
+                    "method": "lmremove",
+                    "exec": kr.get("exec"),
+                })
+                await log_audit(
+                    "AUTO_PREEMPT",
+                    f"Auto-released '{h.get('user')}@{h.get('host')}' "
+                    f"(prio={holder_prio}) on '{fname}' to free a seat for "
+                    f"priority rule '{rule_name}' "
+                    f"(prio={rule_prio}, pattern={u_pat or g_pat or p_pat or '*'}, "
+                    f"server={srv['name']})",
+                    srv["id"], srv["name"], "warning",
+                )
+            except HTTPException as e:
+                results.append({"rule": rule_name, "feature": fname,
+                                "server": srv["name"],
+                                "outcome": f"error: {e.detail}"})
+            except Exception as e:
+                results.append({"rule": rule_name, "feature": fname,
+                                "server": srv["name"],
+                                "outcome": f"error: {str(e)[:120]}"})
+
+    return {"scanned_rules": len(rules), "actioned": actioned,
+            "results": results, "reasons": reasons}
 
 
 async def _auto_preempt_tick() -> dict:
     """One iteration of the auto-preemption loop. Returns a summary dict so the
     on-demand admin endpoint can show what just happened.
+
+    Two passes run on every tick:
+      A) **Rule-driven proactive pass** — for every enabled priority rule,
+         free a seat on any saturated feature where a lower-priority holder
+         exists. Works with wildcard / group / project patterns and does NOT
+         require a real user to be waiting (suits CAD shops where users run
+         `lmutil` from the terminal and don't visit the web UI).
+      B) **Explicit request pass** — drain `pending_requests` and SGE qw jobs
+         (if SGE enabled) using the existing `request_license` pipeline.
     """
     cfg = await get_alert_settings()
-    # Pull pending requests — SGE first (real signal), heuristic fallback
+    fake_admin = {"role": "admin", "email": "auto-preempt@licman"}
+
+    # --- Pass A: rule-driven proactive preemption (wildcard-friendly) ---
+    rule_pass = await _rule_driven_preempt_pass(fake_admin)
+
+    # --- Pass B: explicit pending_requests + SGE waiters ---
     requests: List[dict] = []
     if cfg.get("sge_enabled"):
         try:
@@ -3337,12 +3454,11 @@ async def _auto_preempt_tick() -> dict:
             logger.warning(f"auto-preempt: SGE query failed: {e}")
     if not requests:
         requests = await _heuristic_preempt_candidates()
-    if not requests:
-        return {"scanned": 0, "actioned": 0, "results": []}
 
-    actioned = 0
-    results: List[dict] = []
-    fake_admin = {"role": "admin", "email": "auto-preempt@licman"}
+    actioned = int(rule_pass.get("actioned") or 0)
+    results: List[dict] = list(rule_pass.get("results") or [])
+    reasons: List[dict] = list(rule_pass.get("reasons") or [])
+
     for req in requests:
         srv = await _find_server_for_feature(req["feature"])
         if not srv:
@@ -3396,7 +3512,15 @@ async def _auto_preempt_tick() -> dict:
             results.append({**req, "outcome": f"error: {e.detail}"})
         except Exception as e:
             results.append({**req, "outcome": f"error: {str(e)[:120]}"})
-    return {"scanned": len(requests), "actioned": actioned, "results": results}
+    return {
+        "scanned": len(requests) + int(rule_pass.get("scanned_rules") or 0),
+        "scanned_rules": int(rule_pass.get("scanned_rules") or 0),
+        "scanned_requests": len(requests),
+        "actioned": actioned,
+        "results": results,
+        "reasons": reasons,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 async def _auto_preempt_loop():

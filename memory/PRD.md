@@ -98,6 +98,40 @@ Follow-ups:
 - **CSV exports**: `GET /api/expiry/export` and `GET /api/audit/export` stream CSV with attachment headers. Expiry page + Settings page each carry a download button.
 - **Settings backfill**: `get_alert_settings` merges defaults so legacy DB records expose the new webhook fields to the UI without a manual migration.
 
+## Iteration 14 — Wildcard auto-preempt fix — 2026-02
+
+**Issue (recurring)**: Automatic preemption never triggered even with auto-toggle ON
+and a priority rule configured. Manual preempt worked.
+
+**Root cause**: `_heuristic_preempt_candidates` skipped every rule whose
+`user_pattern` contained a wildcard (line `if not pat or any(ch in pat for ch
+in "*?["): continue`). The user's rules use wildcards (`rakella*`,
+`cad_team_*`), so no candidates were ever generated → loop no-op every tick.
+
+**Fix**: Replaced the synthetic-user heuristic with a new
+`_rule_driven_preempt_pass` invoked from every `_auto_preempt_tick`:
+- For each ENABLED rule, for each feature in the rule (or all features
+  fleet-wide if `features=[]`), if the feature is fully saturated AND at
+  least one current holder has STRICTLY lower priority than the rule,
+  the lowest-priority holder is preempted via `lmremove`.
+- Works with wildcard / group / project patterns (no synthetic requester
+  user required — rule's own priority is the comparison anchor).
+- Skipped silently with structured `reasons` when:
+  - Feature not saturated (`used < total`)
+  - A holder already matches the rule pattern (rule is "already satisfied")
+  - All holders are at or above the rule's priority
+  - No server hosts the feature
+- Frees AT MOST ONE seat per `(rule, feature)` per tick (`freed_this_tick`
+  guard) so a single tick never kills more than necessary.
+
+**Frontend**: New AUTO-PREEMPT MONITOR panel on `/priority`:
+- Shows daemon running/stopped, settings toggle on/off, interval, mode
+- "RUN TICK NOW" button → calls `/api/preempt/auto-tick` and renders
+  RESULTS (green) + SKIP REASONS (amber) cards for self-diagnosis
+- Verified: wildcard `rakella*` rule preempted `jzhang@synth-node-11` on
+  saturated Calibre_DRC; 19 skip reasons surfaced for other rule/feature
+  pairs that were not saturated.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.
