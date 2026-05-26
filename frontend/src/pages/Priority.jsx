@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Zap, Plus, Trash2, Save, AlertTriangle, Crown, Edit3, Database, RefreshCw } from "lucide-react";
+import { Zap, Plus, Trash2, Save, AlertTriangle, Crown, Edit3, Database, RefreshCw, Hourglass, X } from "lucide-react";
 import { api } from "@/lib/api";
 import Header from "@/components/Header";
 import { toast } from "sonner";
@@ -39,6 +39,58 @@ export default function Priority() {
   const [sge, setSge] = useState({ users: [], groups: [], projects: [], loaded: false });
   const [sgeLoading, setSgeLoading] = useState(false);
 
+  // Pending requests queue (SGE-free preemption workflow)
+  const [pending, setPending] = useState([]);
+  const [reqUser, setReqUser] = useState("");
+  const [reqFeature, setReqFeature] = useState("");
+  const [reqSeats, setReqSeats] = useState(1);
+  const [reqServer, setReqServer] = useState("");
+  const [submittingReq, setSubmittingReq] = useState(false);
+
+  const loadPending = async () => {
+    try {
+      const r = await api.listPendingRequests("all");
+      setPending(r);
+    } catch {
+      /* silent — page still loads */
+    }
+  };
+
+  const submitRequest = async () => {
+    if (!reqUser.trim() || !reqFeature.trim()) {
+      toast.error("user and feature are required");
+      return;
+    }
+    setSubmittingReq(true);
+    try {
+      await api.createPendingRequest({
+        user: reqUser.trim(),
+        feature: reqFeature.trim(),
+        seats: Number(reqSeats) || 1,
+        server_id: reqServer || undefined,
+      });
+      toast.success(`Queued: ${reqUser} ↔ ${reqFeature}`);
+      setReqUser("");
+      setReqFeature("");
+      setReqSeats(1);
+      setTimeout(loadPending, 1500); // give the loop a moment to action it
+      loadPending();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Submit failed");
+    } finally {
+      setSubmittingReq(false);
+    }
+  };
+
+  const cancelReq = async (rid) => {
+    try {
+      await api.cancelPendingRequest(rid);
+      loadPending();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Cancel failed");
+    }
+  };
+
   const loadSge = async () => {
     setSgeLoading(true);
     try {
@@ -63,6 +115,9 @@ export default function Priority() {
 
   useEffect(() => {
     load();
+    loadPending();
+    const t = setInterval(loadPending, 10000);
+    return () => clearInterval(t);
   }, []);
 
   const startEdit = (rule) => {
@@ -390,6 +445,138 @@ export default function Priority() {
             </div>
           </section>
         )}
+
+        {/* Pending requests queue */}
+        <section className="bg-[#111] border border-[#222] rounded-sm" data-testid="pending-requests-panel">
+          <div className="px-4 py-3 border-b border-[#222] flex items-center gap-2">
+            <Hourglass size={14} className="text-amber-400" />
+            <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
+              PENDING REQUESTS QUEUE
+            </div>
+            <span className="font-mono text-[11px] text-[#6b7280]">
+              · username-based · auto-actioned by the background loop · no scheduler needed
+            </span>
+          </div>
+          <div className="p-4 grid grid-cols-1 md:grid-cols-5 gap-3 font-mono text-xs border-b border-[#1a1a1a]">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-[#6b7280] mb-1">User *</div>
+              <input
+                value={reqUser}
+                onChange={(e) => setReqUser(e.target.value)}
+                list="sge-users-list"
+                placeholder="ramkella"
+                className="inp"
+                data-testid="pending-user"
+              />
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-[#6b7280] mb-1">Feature *</div>
+              <input
+                value={reqFeature}
+                onChange={(e) => setReqFeature(e.target.value)}
+                placeholder="Innovus"
+                className="inp"
+                data-testid="pending-feature"
+              />
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-[#6b7280] mb-1">Seats</div>
+              <input
+                type="number" min={1}
+                value={reqSeats}
+                onChange={(e) => setReqSeats(e.target.value)}
+                className="inp tabular-nums"
+                data-testid="pending-seats"
+              />
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-[#6b7280] mb-1">Server (optional hint)</div>
+              <select
+                value={reqServer}
+                onChange={(e) => setReqServer(e.target.value)}
+                className="inp"
+                data-testid="pending-server"
+              >
+                <option value="">(any)</option>
+                {servers.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-end">
+              <button
+                onClick={submitRequest}
+                disabled={submittingReq}
+                className="btn-brutal primary flex items-center gap-1.5 w-full justify-center disabled:opacity-50"
+                data-testid="submit-pending-request"
+              >
+                <Plus size={12} /> {submittingReq ? "QUEUING…" : "QUEUE REQUEST"}
+              </button>
+            </div>
+          </div>
+          <div className="overflow-x-auto max-h-80 overflow-y-auto">
+            <table className="w-full font-mono text-[11px]">
+              <thead className="bg-[#0a0a0a] sticky top-0">
+                <tr className="text-left text-[10px] uppercase tracking-wider text-[#6b7280]">
+                  <th className="px-4 py-2">State</th>
+                  <th className="px-4 py-2">User</th>
+                  <th className="px-4 py-2">Feature</th>
+                  <th className="px-4 py-2 text-right">Seats</th>
+                  <th className="px-4 py-2">Queued</th>
+                  <th className="px-4 py-2">Resolved</th>
+                  <th className="px-4 py-2 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pending.map((p) => {
+                  const stateColor = {
+                    open: "#f59e0b",
+                    satisfied: "#10b981",
+                    cancelled: "#6b7280",
+                    expired: "#6b7280",
+                  }[p.state] || "#9ca3af";
+                  return (
+                    <tr key={p.id} className="border-t border-[#1a1a1a] hover:bg-[#141414]">
+                      <td className="px-4 py-1.5">
+                        <span
+                          className="text-[10px] uppercase tracking-wider font-bold"
+                          style={{ color: stateColor }}
+                        >
+                          {p.state}
+                        </span>
+                      </td>
+                      <td className="px-4 py-1.5 text-emerald-400">{p.user}</td>
+                      <td className="px-4 py-1.5 text-white">{p.feature}</td>
+                      <td className="px-4 py-1.5 text-right tabular-nums">{p.seats}</td>
+                      <td className="px-4 py-1.5 text-[#9ca3af]">{p.created_at?.slice(0, 19).replace("T", " ")}</td>
+                      <td className="px-4 py-1.5 text-[#9ca3af]">
+                        {p.resolved_at ? `${p.resolution || ""} @ ${p.resolved_at.slice(11, 19)}` : "—"}
+                      </td>
+                      <td className="px-4 py-1.5 text-right">
+                        {p.state === "open" && (
+                          <button
+                            onClick={() => cancelReq(p.id)}
+                            className="inline-flex items-center gap-1 px-2 py-1 border border-red-900/60 text-red-400 hover:bg-red-900/20 text-[10px] uppercase tracking-wider"
+                            data-testid={`cancel-pending-${p.id}`}
+                          >
+                            <X size={10} /> CANCEL
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {pending.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-10 text-center text-[#6b7280]">
+                      {"// no pending requests — queue one above"}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
 
         {/* Preemption tester */}
         <section className="bg-[#111] border border-[#222] rounded-sm" data-testid="preempt-tester">

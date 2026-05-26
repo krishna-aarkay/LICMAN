@@ -1374,7 +1374,11 @@ async def delete_server(server_id: str, _: dict = Depends(require_admin)):
 
 
 @api_router.put("/servers/{server_id}/license")
-async def save_license_file(server_id: str, payload: FileContent):
+async def save_license_file(server_id: str, payload: FileContent,
+                             push_to_disk: bool = True, reread: bool = True):
+    """Save license file. If license_file_path is set + SSH enabled, also write
+    the content to that path on the remote host (atomic via .new + mv) and
+    optionally fire lmreread so the daemon picks up the new entitlements."""
     res = await db.servers.find_one_and_update(
         {"id": server_id}, {"$set": {"license_file": payload.content}},
         return_document=True, projection={"_id": 0}
@@ -1382,21 +1386,82 @@ async def save_license_file(server_id: str, payload: FileContent):
     if not res:
         raise HTTPException(404, "Server not found")
 
-    # Try to parse FEATURE lines and update features list
+    # Parse INCREMENT/FEATURE lines into the feature list + per-increment tranches
+    inc_map = parse_license_file_increments(payload.content)
     features = []
-    for line in payload.content.splitlines():
-        m = re.match(r"^\s*(?:FEATURE|INCREMENT)\s+(\S+)\s+\S+\s+(\S+)\s+(\S+)\s+(\d+)", line)
-        if m:
-            features.append({
-                "name": m.group(1), "version": m.group(2),
-                "expires": m.group(3), "total": int(m.group(4)),
-            })
+    for fname, increments in inc_map.items():
+        total = sum(int(i.get("count") or 0) for i in increments)
+        # Pick the EARLIEST expiry as the feature's nominal expiry (so dashboard
+        # surfaces the nearest renewal date). Per-tranche detail is in increments[].
+        earliest = ""
+        try:
+            from datetime import datetime as _dt
+            dts = []
+            for i in increments:
+                exp = (i.get("expires") or "").strip()
+                if not exp or exp.lower() in ("permanent", "1-jan-0000"):
+                    continue
+                try:
+                    dts.append((_dt.strptime(exp, "%d-%b-%Y"), exp))
+                except Exception:
+                    pass
+            if dts:
+                dts.sort(key=lambda x: x[0])
+                earliest = dts[0][1]
+        except Exception:
+            pass
+        features.append({
+            "name": fname,
+            "version": increments[0].get("version") or "1.0",
+            "expires": earliest or "permanent",
+            "total": total or 1,
+            "in_use_reported": 0,
+            "increments": increments,
+        })
     if features:
         await db.servers.update_one({"id": server_id}, {"$set": {"features": features}})
 
-    await log_audit("LICENSE_SAVE", f"License file updated for {res['name']} ({len(features)} features parsed)",
-                    server_id, res["name"], "success")
-    return {"ok": True, "features_parsed": len(features)}
+    pushed, push_err, rereaded = False, None, False
+    ssh = res.get("ssh", {}) or {}
+    lic_path = (res.get("license_file_path") or "").strip()
+    is_ssh = res.get("adapter_mode") == "ssh" and ssh.get("enabled") and PARAMIKO_AVAILABLE
+    if push_to_disk and is_ssh and lic_path:
+        import base64
+        b64 = base64.b64encode(payload.content.encode("utf-8")).decode("ascii")
+        # Atomic write: stage to .new, mv into place. Preserves existing perms via cp --preserve.
+        cmd = (
+            f"echo {_shlex.quote(b64)} | base64 -d > {_shlex.quote(lic_path + '.new')} "
+            f"&& (cp --preserve=mode {_shlex.quote(lic_path)} {_shlex.quote(lic_path + '.bak')} 2>/dev/null || true) "
+            f"&& mv {_shlex.quote(lic_path + '.new')} {_shlex.quote(lic_path)} "
+            f"&& echo PUSHED_OK || echo PUSH_FAILED"
+        )
+        pr = await asyncio.to_thread(_ssh_real_exec, _ssh_with_decrypted(ssh), cmd)
+        pushed = "PUSHED_OK" in (pr.get("output") or "")
+        if not pushed:
+            push_err = (pr.get("output") or "")[:300] or "unknown error"
+        if pushed and reread:
+            lmutil = (ssh.get("lmutil_path") or "lmutil").strip()
+            target = f"{res['port']}@{res['host']}"
+            daemon = (res.get("daemon") or "").strip()
+            r_cmd = f"{_shlex.quote(lmutil)} lmreread -c {_shlex.quote(target)}"
+            if daemon:
+                r_cmd += f" -vendor {_shlex.quote(daemon)}"
+            rr = await asyncio.to_thread(_ssh_real_exec, _ssh_with_decrypted(ssh), r_cmd)
+            rereaded = rr.get("exit") == 0
+
+    await log_audit(
+        "LICENSE_SAVE",
+        f"License file updated for {res['name']} · features={len(features)} "
+        f"pushed={pushed} reread={rereaded} path={lic_path or '(db only)'}"
+        f"{' · ERR:' + push_err if push_err else ''}",
+        server_id, res["name"], "warning" if push_err else "success",
+    )
+    return {
+        "ok": True, "features_parsed": len(features),
+        "pushed_to_disk": pushed, "lmreread": rereaded,
+        "license_path": lic_path, "push_error": push_err,
+        "stored_in_db": True,
+    }
 
 
 @api_router.put("/servers/{server_id}/options")
@@ -1853,10 +1918,117 @@ async def fetch_license(server_id: str, path: Optional[str] = None, _: dict = De
         {"id": server_id},
         {"$set": {"license_file": content, "license_file_path": lic_path}},
     )
+    # Also pre-populate per-increment expiry data so the calendar is correct
+    # immediately, without waiting for the next sync.
+    inc_map = parse_license_file_increments(content)
+    if inc_map:
+        cur_features = (await db.servers.find_one({"id": server_id}, {"_id": 0})).get("features", []) or []
+        idx = {f["name"]: f for f in cur_features}
+        for fname, incs in inc_map.items():
+            f = idx.setdefault(fname, {
+                "name": fname,
+                "version": incs[0].get("version") or "1.0",
+                "expires": incs[0].get("expires") or "permanent",
+                "total": sum(int(i.get("count") or 0) for i in incs),
+                "in_use_reported": 0,
+            })
+            f["increments"] = incs
+            f["total"] = sum(int(i.get("count") or 0) for i in incs) or f.get("total") or 1
+        await db.servers.update_one(
+            {"id": server_id}, {"$set": {"features": list(idx.values())}}
+        )
     await log_audit("LICENSE_FETCH",
                     f"Fetched license from {ssh.get('host')}:{lic_path} ({len(content)} bytes)",
                     server_id, doc["name"], "success")
     return {"ok": True, "path": lic_path, "bytes": len(content)}
+
+
+@api_router.post("/servers/{server_id}/fetch-options")
+async def fetch_options(server_id: str, path: Optional[str] = None,
+                         _: dict = Depends(require_admin)):
+    """Pull the actual options file from the license host via SSH.
+    Mirrors fetch_license — uses options_file_path if set, else ?path= override.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Server not found")
+    ssh = doc.get("ssh", {}) or {}
+    if doc.get("adapter_mode") != "ssh" or not ssh.get("enabled"):
+        raise HTTPException(400, "SSH adapter not enabled on this server")
+    opts_path = (path or doc.get("options_file_path") or "").strip()
+    if not opts_path:
+        raise HTTPException(
+            400,
+            "options_file_path is not set on this server. Click 'edit paths' "
+            "on the server detail page and point to your options file (e.g. "
+            "/cadmgr/cadence/options.txt) — then click FETCH again. "
+            "Alternatively pass ?path=/full/path/to/options.txt",
+        )
+    ssh_decrypted = _ssh_with_decrypted(ssh)
+    res = await asyncio.to_thread(
+        _ssh_real_exec, ssh_decrypted, f"cat {_shlex.quote(opts_path)}"
+    )
+    if res.get("exit") != 0:
+        raise HTTPException(
+            502,
+            f"Failed to read remote options file at {opts_path}: "
+            f"{(res.get('output') or 'no output')[:300]}",
+        )
+    content = res.get("output") or ""
+    await db.servers.update_one(
+        {"id": server_id},
+        {"$set": {"options_file": content, "options_file_path": opts_path}},
+    )
+    # Materialize RESERVE directives from the fetched file back into LICMAN's
+    # reservations collection so the Reservations tab matches what's actually
+    # running on the daemon. We REPLACE LICMAN-managed reservations and SKIP
+    # the ones inside the LICMAN-managed sentinel block (those came from us).
+    SENT_START = "# --- LICMAN MANAGED RESERVATIONS START ---"
+    SENT_END = "# --- LICMAN MANAGED RESERVATIONS END ---"
+    in_managed = False
+    discovered = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if line == SENT_START:
+            in_managed = True
+            continue
+        if line == SENT_END:
+            in_managed = False
+            continue
+        if in_managed or not line or line.startswith("#"):
+            continue
+        # RESERVE <count> <feature> <TYPE> <target>
+        m = re.match(
+            r"^RESERVE\s+(\d+)\s+(\S+)\s+(USER|HOST|GROUP|HOST_GROUP|PROJECT|DISPLAY|INTERNET)\s+(\S+)",
+            line, re.IGNORECASE,
+        )
+        if m:
+            discovered.append({
+                "id": str(uuid.uuid4()),
+                "server_id": server_id,
+                "feature": m.group(2),
+                "target_type": m.group(3).upper(),
+                "target": m.group(4),
+                "count": int(m.group(1)),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source": "options-file",
+            })
+    if discovered:
+        # Replace only options-file-sourced reservations (preserve UI-added ones)
+        await db.reservations.delete_many({
+            "server_id": server_id, "source": "options-file"
+        })
+        await db.reservations.insert_many(discovered)
+    await log_audit(
+        "OPTIONS_FETCH",
+        f"Fetched options from {ssh.get('host')}:{opts_path} "
+        f"({len(content)} bytes, {len(discovered)} RESERVE entries imported)",
+        server_id, doc["name"], "success",
+    )
+    return {
+        "ok": True, "path": opts_path, "bytes": len(content),
+        "reservations_imported": len(discovered),
+    }
 
 
 # ---------- Bulk operations ----------
@@ -3079,18 +3251,51 @@ async def _find_server_for_feature(feature: str) -> Optional[dict]:
 
 
 async def _heuristic_preempt_candidates() -> List[dict]:
-    """SGE-free fallback. Treat every active priority rule as an implicit
-    'this user/group wants these features' request. If a matching feature is
-    saturated AND no current holder matches the rule, we synthesize a request.
-    This lets the loop work even before SGE is configured."""
+    """SGE-free fallback. Two signal sources, merged:
+
+    1. **Pending requests queue** (`db.pending_requests`) — admins / engineers
+       explicitly ask: "ramkella needs Innovus". This is the cleanest signal
+       when you don't have a job scheduler.
+    2. **Priority-rule heuristic** — every active rule with a literal username
+       is treated as "this user wants these features" so the loop preempts
+       proactively even before someone clicks REQUEST.
+    """
+    # 1) Explicit pending requests — drain & retry
+    pending = await db.pending_requests.find(
+        {"state": "open"}, {"_id": 0}
+    ).sort("created_at", 1).to_list(500)
+    out: List[dict] = []
+    seen: set = set()
+    for p in pending:
+        # Skip aged-out requests (> 1h) — they probably gave up
+        try:
+            ts = datetime.fromisoformat((p.get("created_at") or "").replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - ts).total_seconds() > 3600:
+                await db.pending_requests.update_one(
+                    {"id": p["id"]}, {"$set": {"state": "expired"}}
+                )
+                continue
+        except Exception:
+            pass
+        out.append({
+            "jobid": f"req:{p['id']}",
+            "user": p["user"], "project": "",
+            "feature": p["feature"], "seats": int(p.get("seats") or 1),
+            "_request_id": p["id"],
+        })
+        seen.add(("req", p["id"]))
+
+    # 2) Priority-rule heuristic — only triggers if the user matches a literal
+    #    pattern AND the feature is saturated AND they don't already hold a seat.
     rules = await db.priority_rules.find(
         {"enabled": True}, {"_id": 0}
     ).sort("priority", -1).to_list(500)
-    out: List[dict] = []
-    seen: set = set()
     for r in rules:
         feats = r.get("features") or []
         if not feats:
+            continue
+        pat = (r.get("user_pattern") or "").strip()
+        if not pat or any(ch in pat for ch in "*?["):
             continue
         for fname in feats:
             srv = await _find_server_for_feature(fname)
@@ -3105,13 +3310,6 @@ async def _heuristic_preempt_candidates() -> List[dict]:
             used = sum(int(h.get("count") or 1) for h in holders)
             if used < int(feat.get("total") or 0):
                 continue  # Free seats — no preemption needed
-            # The rule's pattern is a glob — try to materialize it to a literal
-            # username only if it doesn't contain wildcards (`*?`); otherwise
-            # we can't preempt for an unknown user.
-            pat = (r.get("user_pattern") or "").strip()
-            if not pat or any(ch in pat for ch in "*?["):
-                continue
-            # Already has a checkout? Skip — they're satisfied.
             if any(h.get("user", "").lower() == pat.lower() for h in holders):
                 continue
             key = (srv["id"], fname, pat)
@@ -3119,11 +3317,8 @@ async def _heuristic_preempt_candidates() -> List[dict]:
                 continue
             seen.add(key)
             out.append({
-                "jobid": f"rule:{r['id']}",
-                "user": pat,
-                "project": "",
-                "feature": fname,
-                "seats": 1,
+                "jobid": f"rule:{r['id']}", "user": pat, "project": "",
+                "feature": fname, "seats": 1,
             })
     return out
 
@@ -3168,14 +3363,32 @@ async def _auto_preempt_tick() -> dict:
         try:
             res = await request_license(payload, fake_admin)  # type: ignore
             outcome = res.get("action") or "unknown"
-            if outcome == "preempted":
-                actioned += 1
-                await log_audit(
-                    "AUTO_PREEMPT",
-                    f"Auto-released seat for '{req['user']}' on '{req['feature']}' "
-                    f"(SGE jobid={req['jobid']}, server={srv['name']}, "
-                    f"seats_freed={res.get('seats_freed')})",
-                    srv["id"], srv["name"], "warning",
+            req_id = req.get("_request_id")
+            if outcome in ("preempted", "available"):
+                actioned += 1 if outcome == "preempted" else 0
+                if req_id:
+                    await db.pending_requests.update_one(
+                        {"id": req_id},
+                        {"$set": {
+                            "state": "satisfied",
+                            "resolved_at": datetime.now(timezone.utc).isoformat(),
+                            "resolution": outcome,
+                        }},
+                    )
+                if outcome == "preempted":
+                    await log_audit(
+                        "AUTO_PREEMPT",
+                        f"Auto-released seat for '{req['user']}' on '{req['feature']}' "
+                        f"(source={req['jobid']}, server={srv['name']}, "
+                        f"seats_freed={res.get('seats_freed')})",
+                        srv["id"], srv["name"], "warning",
+                    )
+            elif outcome == "denied_low_priority" and req_id:
+                # Keep the request open but log the denial so the admin sees it
+                await db.pending_requests.update_one(
+                    {"id": req_id},
+                    {"$set": {"last_attempt": datetime.now(timezone.utc).isoformat(),
+                              "last_outcome": outcome}},
                 )
             results.append({**req, "outcome": outcome,
                             "seats_freed": res.get("seats_freed")})
@@ -3232,6 +3445,74 @@ async def preempt_auto_status():
         "sge_enabled": bool(cfg.get("sge_enabled")),
         "mode": "sge+heuristic" if cfg.get("sge_enabled") else "heuristic-only",
     }
+
+
+# ---------- Pending requests queue (SGE-free preemption workflow) ----------
+
+class PendingRequestCreate(BaseModel):
+    user: str
+    feature: str
+    seats: int = 1
+    server_id: Optional[str] = None
+    note: str = ""
+
+
+@api_router.post("/pending-requests")
+async def create_pending_request(payload: PendingRequestCreate, _: dict = Depends(require_admin)):
+    """Queue a license request. The auto-preempt loop will action it on its
+    next tick — preempting the lowest-priority holder if the requester
+    outranks them via the configured priority rules. Pure username-based,
+    no SGE / job scheduler required."""
+    if not payload.user.strip():
+        raise HTTPException(400, "user is required")
+    if not payload.feature.strip():
+        raise HTTPException(400, "feature is required")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user": payload.user.strip(),
+        "feature": payload.feature.strip(),
+        "seats": max(1, int(payload.seats or 1)),
+        "server_id": payload.server_id,
+        "note": payload.note,
+        "state": "open",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.pending_requests.insert_one(doc)
+    await log_audit(
+        "PENDING_REQUEST",
+        f"Queued request: {doc['user']} wants {doc['seats']}× {doc['feature']}",
+        payload.server_id, None, "info",
+    )
+    # Best-effort: trigger an immediate tick so the user sees fast results
+    try:
+        cfg = await get_alert_settings()
+        if cfg.get("auto_preempt_enabled"):
+            asyncio.create_task(_auto_preempt_tick())
+    except Exception:
+        pass
+    return {"ok": True, "request": {k: v for k, v in doc.items() if k != "_id"}}
+
+
+@api_router.get("/pending-requests")
+async def list_pending_requests(state: str = "open", limit: int = 200):
+    q: dict = {} if state == "all" else {"state": state}
+    docs = await db.pending_requests.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    return docs
+
+
+@api_router.delete("/pending-requests/{rid}")
+async def cancel_pending_request(rid: str, _: dict = Depends(require_admin)):
+    res = await db.pending_requests.find_one_and_update(
+        {"id": rid, "state": "open"},
+        {"$set": {"state": "cancelled",
+                  "resolved_at": datetime.now(timezone.utc).isoformat()}},
+        projection={"_id": 0},
+    )
+    if not res:
+        raise HTTPException(404, "Request not found or already resolved")
+    await log_audit("PENDING_CANCEL", f"Cancelled request: {res['user']} ↔ {res['feature']}",
+                    None, None, "info")
+    return {"ok": True}
 
 
 # ---------- end auto-preempt scheduler ----------

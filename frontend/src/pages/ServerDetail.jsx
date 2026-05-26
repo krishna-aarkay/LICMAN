@@ -99,7 +99,12 @@ export default function ServerDetail() {
   const saveLicense = async () => {
     try {
       const r = await api.saveLicense(id, licText);
-      toast.success(`License saved · ${r.features_parsed} features parsed`);
+      let msg = `License saved · ${r.features_parsed} features parsed`;
+      if (r.pushed_to_disk) msg += ` · pushed to ${r.license_path}`;
+      if (r.lmreread) msg += " · lmreread OK";
+      if (r.push_error) msg += ` · push FAILED: ${r.push_error}`;
+      if (r.push_error) toast.error(msg);
+      else toast.success(msg);
       setLicDirty(false);
       load();
     } catch (e) {
@@ -107,14 +112,41 @@ export default function ServerDetail() {
     }
   };
 
+  const fetchLicenseFromServer = async () => {
+    try {
+      const r = await api.fetchLicense(id);
+      toast.success(`Fetched ${r.bytes} bytes from ${r.path}`);
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Fetch failed");
+    }
+  };
+
   const saveOptions = async () => {
     try {
-      await api.saveOptions(id, optText);
-      toast.success("Options saved");
+      const r = await api.saveOptions(id, optText);
+      let msg = "Options saved";
+      if (r.pushed_to_disk) msg += ` · pushed to ${r.options_path}`;
+      if (r.lmreread) msg += " · lmreread OK";
+      if (r.push_error) msg += ` · push FAILED: ${r.push_error}`;
+      if (r.push_error) toast.error(msg);
+      else toast.success(msg);
       setOptDirty(false);
       load();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Save failed");
+    }
+  };
+
+  const fetchOptionsFromServer = async () => {
+    try {
+      const r = await api.fetchOptions(id);
+      toast.success(
+        `Fetched ${r.bytes} bytes · ${r.reservations_imported} RESERVE entr${r.reservations_imported === 1 ? "y" : "ies"} imported`,
+      );
+      load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Fetch failed");
     }
   };
 
@@ -628,25 +660,19 @@ export default function ServerDetail() {
               onSave={saveLicense}
               testId="license-panel"
               saveTestId="save-license-btn"
-              extraActions={server.adapter_mode === "ssh" && isAdmin ? (
-                <button
-                  className="btn-brutal flex items-center gap-1.5"
-                  onClick={async () => {
-                    try {
-                      const r = await api.fetchLicense(id);
-                      toast.success(`Fetched from ${r.path} (${r.bytes} bytes)`);
-                      setLicDirty(false);
-                      load();
-                    } catch (e) {
-                      toast.error(e?.response?.data?.detail || "Fetch failed");
-                    }
-                  }}
-                  data-testid="fetch-license-btn"
-                  title="cat the .lic file from the license host over SSH"
-                >
-                  <Download size={12} /> FETCH FROM SERVER
-                </button>
-              ) : null}
+              saveLabel="SAVE & PUSH"
+              extraActions={
+                isAdmin ? (
+                  <button
+                    className="btn-brutal flex items-center gap-1.5"
+                    onClick={fetchLicenseFromServer}
+                    data-testid="fetch-license-btn"
+                    title="Read the actual license file from the configured license_file_path"
+                  >
+                    <Download size={12} /> FETCH FROM SERVER
+                  </button>
+                ) : null
+              }
             >
               <CodeEditor
                 value={licText}
@@ -657,6 +683,15 @@ export default function ServerDetail() {
                 language="license"
                 testId="license-editor"
               />
+              {!server.license_file_path && isAdmin && (
+                <div className="mt-3 px-3 py-2 border border-amber-900/40 bg-amber-900/10 font-mono text-[10px] text-amber-400">
+                  ⚠ <b>license_file_path</b> is not set on this server. Save&nbsp;&amp;&nbsp;Push will
+                  store the edited file in LICMAN&apos;s database only — it will NOT update the file
+                  on disk and the daemon won&apos;t see your changes. Click <b>edit paths</b> at
+                  the top of the page to point to the real file (e.g.{" "}
+                  <code className="text-white">/cadmgr/cadence/license.dat</code>).
+                </div>
+              )}
             </EditorPanel>
           </TabsContent>
 
@@ -667,18 +702,31 @@ export default function ServerDetail() {
               onSave={saveOptions}
               testId="options-panel"
               saveTestId="save-options-btn"
+              saveLabel="SAVE & PUSH"
               hint="Directives: RESERVE | INCLUDE | EXCLUDE | GROUP | MAX | TIMEOUT"
               extraActions={
-                <button
-                  onClick={validateOpts}
-                  disabled={validating}
-                  className="btn-brutal flex items-center gap-1.5 disabled:opacity-50"
-                  data-testid="validate-options-btn"
-                  title="Lint the options file against FlexLM directive syntax"
-                >
-                  <ListChecks size={12} />
-                  {validating ? "VALIDATING…" : "VALIDATE"}
-                </button>
+                <>
+                  {isAdmin && (
+                    <button
+                      className="btn-brutal flex items-center gap-1.5"
+                      onClick={fetchOptionsFromServer}
+                      data-testid="fetch-options-btn"
+                      title="Read the actual options file from options_file_path + import RESERVE lines into the reservations table"
+                    >
+                      <Download size={12} /> FETCH FROM SERVER
+                    </button>
+                  )}
+                  <button
+                    onClick={validateOpts}
+                    disabled={validating}
+                    className="btn-brutal flex items-center gap-1.5 disabled:opacity-50"
+                    data-testid="validate-options-btn"
+                    title="Lint the options file against FlexLM directive syntax"
+                  >
+                    <ListChecks size={12} />
+                    {validating ? "VALIDATING…" : "VALIDATE"}
+                  </button>
+                </>
               }
             >
               <CodeEditor
@@ -691,6 +739,14 @@ export default function ServerDetail() {
                 language="options"
                 testId="options-editor"
               />
+              {!server.options_file_path && isAdmin && (
+                <div className="mt-3 px-3 py-2 border border-amber-900/40 bg-amber-900/10 font-mono text-[10px] text-amber-400">
+                  ⚠ <b>options_file_path</b> is not set. Save&nbsp;&amp;&nbsp;Push will store the
+                  file in LICMAN&apos;s database only — point to your real options file via the
+                  edit-paths link at the top, then FETCH FROM SERVER to import what&apos;s
+                  currently in production.
+                </div>
+              )}
               {optValidation && (
                 <div
                   className="mt-3 border border-[#222] bg-[#0a0a0a] rounded-sm"
@@ -999,7 +1055,7 @@ const FeatureDetailModal = ({ feature, server, checkouts, reservations, onClose,
   );
 };
 
-const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint, extraActions }) => (
+const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint, extraActions, saveLabel }) => (
   <div className="bg-[#111] border border-[#222] rounded-sm" data-testid={testId}>
     <div className="px-4 py-3 border-b border-[#222] flex items-center justify-between flex-wrap gap-2">
       <div>
@@ -1019,7 +1075,7 @@ const EditorPanel = ({ title, dirty, onSave, children, testId, saveTestId, hint,
           disabled={!dirty}
           data-testid={saveTestId || `${testId}-save`}
         >
-          <Save size={12} /> SAVE & APPLY
+          <Save size={12} /> {saveLabel || "SAVE & APPLY"}
         </button>
       </div>
     </div>

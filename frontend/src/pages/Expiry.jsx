@@ -60,14 +60,17 @@ export default function Expiry() {
   };
 
   const summary = useMemo(() => {
-    return rows.reduce(
+    // Use the CURRENTLY FILTERED list so tile counts match the table.
+    return grouped.reduce(
       (acc, r) => {
         acc[r.status] = (acc[r.status] || 0) + 1;
         return acc;
       },
-      {}
+      {},
     );
-  }, [rows]);
+  }, [grouped]);
+
+  const totalShown = grouped.length;
 
   return (
     <div className="min-h-screen bg-[#050505]" data-testid="expiry-page">
@@ -84,13 +87,50 @@ export default function Expiry() {
             </h1>
           </div>
 
-          {/* Summary tiles */}
-          <div className="flex items-center gap-2 font-mono text-[11px]">
-            <Tile label="EXPIRED" n={summary.expired || 0} color="#ef4444" />
-            <Tile label="CRITICAL" n={summary.critical || 0} color="#ef4444" />
-            <Tile label="WARN" n={summary.warning || 0} color="#f59e0b" />
-            <Tile label="OK" n={summary.ok || 0} color="#10b981" />
-            <Tile label="PERMANENT" n={summary.permanent || 0} color="#6b7280" />
+          {/* Summary tiles — clickable filter buttons that match the visible table */}
+          <div className="flex items-center gap-2 font-mono text-[11px] flex-wrap">
+            <Tile
+              label="ALL"
+              n={totalShown}
+              color="#9ca3af"
+              active={statusFilter === "ALL"}
+              onClick={() => setStatusFilter("ALL")}
+            />
+            <Tile
+              label="EXPIRED"
+              n={summary.expired || 0}
+              color="#ef4444"
+              active={statusFilter === "expired"}
+              onClick={() => setStatusFilter("expired")}
+            />
+            <Tile
+              label="CRITICAL"
+              n={summary.critical || 0}
+              color="#ef4444"
+              active={statusFilter === "critical"}
+              onClick={() => setStatusFilter("critical")}
+            />
+            <Tile
+              label="WARN"
+              n={summary.warning || 0}
+              color="#f59e0b"
+              active={statusFilter === "warning"}
+              onClick={() => setStatusFilter("warning")}
+            />
+            <Tile
+              label="OK"
+              n={summary.ok || 0}
+              color="#10b981"
+              active={statusFilter === "ok"}
+              onClick={() => setStatusFilter("ok")}
+            />
+            <Tile
+              label="PERMANENT"
+              n={summary.permanent || 0}
+              color="#6b7280"
+              active={statusFilter === "permanent"}
+              onClick={() => setStatusFilter("permanent")}
+            />
             <a
               href={api.expiryExportUrl(180)}
               className="btn-brutal flex items-center gap-1.5 ml-2"
@@ -164,7 +204,7 @@ export default function Expiry() {
                   const meta = vendorMeta(r.vendor);
                   return (
                     <tr
-                      key={`${r.server_id}-${r.feature}`}
+                      key={`${r.server_id}-${r.feature}-${r.expires_iso || r.expires || "perm"}`}
                       className={`border-t border-[#1a1a1a] hover:bg-[#1a1a1a] ${i % 2 ? "bg-[#0d0d0d]" : ""}`}
                       data-testid={`expiry-row-${r.feature}-${r.server_id}`}
                     >
@@ -207,16 +247,20 @@ export default function Expiry() {
   );
 }
 
-const Tile = ({ label, n, color }) => (
-  <div
-    className="border border-[#222] bg-[#111] px-3 py-1.5 flex items-center gap-2"
+const Tile = ({ label, n, color, active, onClick }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className={`border px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-colors ${
+      active ? "border-white bg-[#1a1a1a]" : "border-[#222] bg-[#111] hover:border-[#333]"
+    }`}
     data-testid={`expiry-summary-${label.toLowerCase()}`}
   >
     <span className="uppercase tracking-wider text-[#6b7280]">{label}</span>
     <span className="font-bold tabular-nums" style={{ color }}>
       {n}
     </span>
-  </div>
+  </button>
 );
 
 const ExTh = ({ col, label, onClick, icon, align }) => (

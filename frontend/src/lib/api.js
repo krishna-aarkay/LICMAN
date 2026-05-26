@@ -76,6 +76,18 @@ export const api = {
   requestLicense: (data) => http.post(`/license/request`, data).then((r) => r.data),
   syncReservationsToOptions: (id) =>
     http.post(`/servers/${id}/options/sync-reservations`).then((r) => r.data),
+  fetchOptions: (id, path) =>
+    http.post(`/servers/${id}/fetch-options`, null, {
+      params: path ? { path } : {},
+    }).then((r) => r.data),
+
+  // pending requests queue (SGE-free preemption workflow)
+  listPendingRequests: (state = "open") =>
+    http.get(`/pending-requests`, { params: { state } }).then((r) => r.data),
+  createPendingRequest: (data) =>
+    http.post(`/pending-requests`, data).then((r) => r.data),
+  cancelPendingRequest: (id) =>
+    http.delete(`/pending-requests/${id}`).then((r) => r.data),
   saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
   setAdapter: (id, mode) =>
     http.put(`/servers/${id}/adapter`, { adapter_mode: mode }).then((r) => r.data),
