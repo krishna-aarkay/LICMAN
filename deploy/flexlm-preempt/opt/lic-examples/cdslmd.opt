@@ -1,0 +1,23 @@
+# /opt/cadence/lic/cdslmd.opt  — Cadence vendor options file
+# Reference from your license.dat:
+#     VENDOR cdslmd OPTIONS=/opt/cadence/lic/cdslmd.opt
+# Reread after editing:
+#     lmutil lmreread -c 5280@licsrv01 -vendor cdslmd
+
+# ---- Groups -------------------------------------------------------------
+# High-priority engineers (mirror /etc/licman/<feature>.priority)
+GROUP hipri  ramkella arya sr_team1
+
+# Everyone else who should be allowed to use Cadence tools
+GROUP lopri  junior1 junior2 intern_b cad_team_jr
+
+# ---- Soft caps (defence-in-depth on top of the wrapper) -----------------
+# Junior users can hold AT MOST 1 Innovus seat across the whole org.
+MAX 1 innovus GROUP lopri
+
+# Auto-reclaim idle sessions after 1 hour. The wrapper does on-demand
+# preemption; this is just a safety net for forgotten interactive sessions.
+TIMEOUTALL 3600
+
+# ---- Audit / report ------------------------------------------------------
+REPORTLOG +/var/log/cdslmd-report.log

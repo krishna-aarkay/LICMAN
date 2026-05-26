@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/licman-preempt   owner: root:root   mode: 0750
+# The ONLY privileged piece. Validates args, then runs lmutil lmremove.
+# Called via sudo by /usr/local/bin/tool-wrapper.
+#
+# Usage:  licman-preempt <feature> <user> <host>
+set -euo pipefail
+
+CONF="/etc/licman/config.env"
+[[ -r "$CONF" ]] || { echo "licman-preempt: $CONF missing" >&2; exit 10; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+: "${LMUTIL:=/usr/local/flexlm/lmutil}"
+: "${LIC:?LIC must be set in $CONF}"
+
+F="${1:-}"; U="${2:-}"; H="${3:-}"
+[[ -n "$F" && "$F" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo "bad feature"; exit 11; }
+[[ -n "$U" && "$U" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo "bad user";    exit 12; }
+[[ -n "$H" && "$H" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo "bad host";    exit 13; }
+
+logger -t licman-preempt "kicking $U@$H from $F (requested by ${SUDO_USER:-unknown})"
+exec "$LMUTIL" lmremove -c "$LIC" "$F" "$U" "$H"

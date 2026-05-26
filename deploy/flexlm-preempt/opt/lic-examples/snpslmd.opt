@@ -1,0 +1,17 @@
+# /opt/synopsys/lic/snpslmd.opt  — Synopsys vendor options file
+# Reference from your license.dat:
+#     VENDOR snpslmd OPTIONS=/opt/synopsys/lic/snpslmd.opt
+# Reread:
+#     lmutil lmreread -c 27000@licsrv02 -vendor snpslmd
+
+GROUP hipri  ramkella arya sr_team1
+GROUP lopri  junior1 junior2 intern_b
+
+# Cap junior team to 1 VCS seat
+MAX 1 VCS-RuntimeNetlist GROUP lopri
+
+# Synopsys honours TIMEOUTALL but silently rounds up to 7200 (2h) on some
+# versions. Keep generous.
+TIMEOUTALL 7200
+
+REPORTLOG +/var/log/snpslmd-report.log

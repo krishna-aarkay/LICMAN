@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# flexlm-preempt — generic EDA-tool wrapper.
+# Symlink this to /usr/local/bin/<tool> for every tool you want to wrap.
+# Reads /etc/licman/config.env for license server, lmutil path, and the
+# per-tool TOOL_MAP entry.
+#
+# Exit codes
+#   0    Tool exited normally (we exec'd it; this is the tool's own code)
+#   2    Backed-off because a priority user is waiting (BACK_OFF_FOR_PRIORITY)
+#   10   config.env missing
+#   11   tool not registered in TOOL_MAP
+#   12   real binary not executable
+set -uo pipefail
+
+# ---- Load config -----------------------------------------------------------
+CONF="/etc/licman/config.env"
+if [[ ! -r "$CONF" ]]; then
+    echo "flexlm-preempt: $CONF not found or not readable" >&2
+    exit 10
+fi
+# shellcheck disable=SC1090
+source "$CONF"
+
+# ---- Resolve "who am I?" from $0 ------------------------------------------
+ME_TOOL="$(basename "$0")"          # e.g. innovus / virtuoso / vcs
+ME_USER="${USER:-$(id -un)}"
+ME_HOST="$(hostname -s)"
+
+ENTRY="${TOOL_MAP[$ME_TOOL]:-}"
+if [[ -z "$ENTRY" ]]; then
+    echo "flexlm-preempt: '$ME_TOOL' not registered in TOOL_MAP (edit $CONF)" >&2
+    exit 11
+fi
+FEATURE="${ENTRY%%:*}"
+REAL="${ENTRY#*:}"
+if [[ ! -x "$REAL" ]]; then
+    echo "flexlm-preempt: real binary '$REAL' not executable" >&2
+    exit 12
+fi
+
+PRIO_FILE="${LICMAN_DIR:-/etc/licman}/${FEATURE}.priority"
+WAIT_DIR="${WAIT_DIR:-/var/lib/licman}"
+WAIT_FLAG="${WAIT_DIR}/${FEATURE}.waiting"
+SETTLE_SEC="${SETTLE_SEC:-3}"
+LOG="${LOG:-/var/log/licman/wrapper.log}"
+BACK_OFF_FOR_PRIORITY="${BACK_OFF_FOR_PRIORITY:-0}"
+PREEMPT_VIA_SSH="${PREEMPT_VIA_SSH:-}"
+SSH_KEY="${SSH_KEY:-/etc/licman/preempt.key}"
+
+mkdir -p "$(dirname "$LOG")" "$WAIT_DIR" 2>/dev/null || true
+log() { printf '%s %s[%s/%s] %s\n' "$(date '+%F %T')" "$ME_TOOL" "$ME_USER" "$ME_HOST" "$*" >>"$LOG" 2>/dev/null || true; }
+
+is_priority() {
+    [[ -f "$PRIO_FILE" ]] && grep -qxF "$ME_USER" "$PRIO_FILE"
+}
+
+# ---- Back-off check: am I a low-priority user with a priority user waiting? -
+if [[ "$BACK_OFF_FOR_PRIORITY" == "1" ]] && [[ -f "$WAIT_FLAG" ]] && ! is_priority; then
+    age=$(( $(date +%s) - $(stat -c %Y "$WAIT_FLAG" 2>/dev/null || echo 0) ))
+    if (( age < 600 )); then  # ignore stale > 10 min
+        log "back-off: priority user is waiting for $FEATURE (flag age ${age}s)"
+        echo "flexlm-preempt: a priority user is waiting for $FEATURE — please retry later." >&2
+        exit 2
+    fi
+fi
+
+# ---- Snapshot current FlexLM state ----------------------------------------
+RAW="$("$LMUTIL" lmstat -c "$LIC" -f "$FEATURE" 2>/dev/null || true)"
+
+# "Users of innovus:  (Total of 1 license issued;  Total of 1 license in use)"
+USED=0; TOTAL=0
+while IFS= read -r ln; do
+    if [[ "$ln" =~ Users\ of\ "$FEATURE":.*Total\ of\ ([0-9]+)\ licenses?\ issued ]]; then
+        TOTAL="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$ln" =~ Total\ of\ ([0-9]+)\ licenses?\ in\ use ]]; then
+        USED="${BASH_REMATCH[1]}"
+    fi
+done <<<"$RAW"
+
+# Holder lines look like:
+#   "    ramkella wks-sjc-12 /dev/tty (v22.10) (...), start Mon 2/24 10:15"
+# user is $1, host is $2 (sometimes $2 is a display like :0; we filter that)
+declare -a HOLDER_USERS=() HOLDER_HOSTS=()
+while IFS= read -r ln; do
+    # match a holder line: starts with whitespace, then non-space user, then host
+    if [[ "$ln" =~ ^[[:space:]]+([A-Za-z0-9._-]+)[[:space:]]+([A-Za-z0-9._-]+)[[:space:]]+.*start\ [A-Z][a-z]+ ]]; then
+        HOLDER_USERS+=("${BASH_REMATCH[1]}")
+        HOLDER_HOSTS+=("${BASH_REMATCH[2]}")
+    fi
+done <<<"$RAW"
+
+log "lmstat used=$USED total=$TOTAL holders=${#HOLDER_USERS[@]}"
+
+# ---- Preempt if needed ----------------------------------------------------
+preempted=0
+if (( TOTAL > 0 )) && (( USED >= TOTAL )) && is_priority; then
+    # am I already holding a seat? then no need to preempt
+    already_holding=0
+    for u in "${HOLDER_USERS[@]:-}"; do
+        [[ "$u" == "$ME_USER" ]] && { already_holding=1; break; }
+    done
+
+    if (( already_holding == 1 )); then
+        log "I already hold a seat — no preempt"
+    else
+        # raise the waiting flag so low-priority wrappers can back off (optional)
+        touch "$WAIT_FLAG" 2>/dev/null || true
+
+        victim_user=""; victim_host=""
+        for i in "${!HOLDER_USERS[@]}"; do
+            u="${HOLDER_USERS[$i]}"; h="${HOLDER_HOSTS[$i]}"
+            if [[ "$u" != "$ME_USER" ]] && ! grep -qxF "$u" "$PRIO_FILE" 2>/dev/null; then
+                victim_user="$u"; victim_host="$h"; break
+            fi
+        done
+
+        if [[ -n "$victim_user" ]]; then
+            log "preempting $victim_user@$victim_host for feature $FEATURE"
+            if [[ -n "$PREEMPT_VIA_SSH" ]]; then
+                ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                    "$PREEMPT_VIA_SSH" \
+                    sudo /usr/local/sbin/licman-preempt "$FEATURE" "$victim_user" "$victim_host" \
+                    >>"$LOG" 2>&1 && preempted=1 || log "ssh-preempt failed"
+            else
+                sudo -n /usr/local/sbin/licman-preempt "$FEATURE" "$victim_user" "$victim_host" \
+                    >>"$LOG" 2>&1 && preempted=1 || log "sudo-preempt failed"
+            fi
+            if (( preempted == 1 )); then
+                log "preempt OK — sleeping ${SETTLE_SEC}s for FlexLM to settle"
+                sleep "$SETTLE_SEC"
+            fi
+        else
+            log "feature saturated but no low-priority victim available — passing through"
+        fi
+    fi
+fi
+
+# ---- Clean up wait flag on exit if we set it ------------------------------
+if (( preempted == 1 )); then
+    trap '"rm" -f "$WAIT_FLAG" 2>/dev/null || true' EXIT
+fi
+
+# ---- Hand off to the real binary ------------------------------------------
+log "exec $REAL $*"
+exec "$REAL" "$@"

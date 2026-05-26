@@ -1,0 +1,9 @@
+# /etc/licman/innovus.priority
+# One username per line. Comments (#) and blank lines are ignored by grep -x
+# only if you remove them — keep this file simple.
+#
+# Users listed here will trigger preemption of non-priority holders when they
+# launch a tool whose FlexLM feature is saturated.
+ramkella
+arya
+sr_team1

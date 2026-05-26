@@ -1,0 +1,18 @@
+# /opt/mentor/lic/mgcld.opt  — Mentor / Siemens vendor options file
+# Reference from your license.dat:
+#     VENDOR mgcld OPTIONS=/opt/mentor/lic/mgcld.opt
+# Reread:
+#     lmutil lmreread -c 1717@licsrv03 -vendor mgcld
+#
+# NB. Mentor sometimes ignores TIMEOUTALL. The wrapper is your real
+# preemption mechanism.
+
+GROUP hipri  ramkella arya sr_team1
+GROUP lopri  junior1 junior2 intern_b
+
+MAX 1 Calibre_DRC GROUP lopri
+MAX 2 Questa_Sim  GROUP lopri
+
+TIMEOUTALL 3600
+
+REPORTLOG +/var/log/mgcld-report.log

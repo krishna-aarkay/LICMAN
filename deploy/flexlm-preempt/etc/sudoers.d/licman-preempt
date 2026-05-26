@@ -1,0 +1,7 @@
+# /etc/sudoers.d/licman-preempt
+# Members of the priority-users POSIX group may run the lmremove helper
+# without a password. The helper validates all args before exec'ing lmutil.
+
+%priority-users ALL=(root) NOPASSWD: /usr/local/sbin/licman-preempt
+Defaults!/usr/local/sbin/licman-preempt !requiretty
+Defaults!/usr/local/sbin/licman-preempt env_keep += "USER LOGNAME"
