@@ -66,14 +66,12 @@ export const api = {
       params: path ? { path } : {},
     }).then((r) => r.data),
 
-  // SGE auto-discovery
+  // SGE auto-discovery (DEPRECATED in v2 — kept for back-compat only)
   sgeUsers: () => http.get(`/sge/users`).then((r) => r.data),
   sgeGroups: () => http.get(`/sge/groups`).then((r) => r.data),
   sgeProjects: () => http.get(`/sge/projects`).then((r) => r.data),
   sgeTest: () => http.get(`/sge/test`).then((r) => r.data),
 
-  // request license (auto-preempt if needed)
-  requestLicense: (data) => http.post(`/license/request`, data).then((r) => r.data),
   syncReservationsToOptions: (id) =>
     http.post(`/servers/${id}/options/sync-reservations`).then((r) => r.data),
   fetchOptions: (id, path) =>
@@ -81,13 +79,6 @@ export const api = {
       params: path ? { path } : {},
     }).then((r) => r.data),
 
-  // pending requests queue (SGE-free preemption workflow)
-  listPendingRequests: (state = "open") =>
-    http.get(`/pending-requests`, { params: { state } }).then((r) => r.data),
-  createPendingRequest: (data) =>
-    http.post(`/pending-requests`, data).then((r) => r.data),
-  cancelPendingRequest: (id) =>
-    http.delete(`/pending-requests/${id}`).then((r) => r.data),
   saveSsh: (id, data) => http.put(`/servers/${id}/ssh`, data).then((r) => r.data),
   setAdapter: (id, mode) =>
     http.put(`/servers/${id}/adapter`, { adapter_mode: mode }).then((r) => r.data),
@@ -124,14 +115,15 @@ export const api = {
   stats: () => http.get(`/stats`).then((r) => r.data),
   clearHistory: () => http.post(`/seed/reset`).then((r) => r.data),
 
-  // priority rules / preemption (SGE-aware)
-  listPriorityRules: () => http.get(`/priority-rules`).then((r) => r.data),
-  createPriorityRule: (data) => http.post(`/priority-rules`, data).then((r) => r.data),
-  updatePriorityRule: (id, data) => http.patch(`/priority-rules/${id}`, data).then((r) => r.data),
-  deletePriorityRule: (id) => http.delete(`/priority-rules/${id}`).then((r) => r.data),
-  preemptPlan: (data) => http.post(`/preempt/plan`, data).then((r) => r.data),
-  preemptRun: (data) => http.post(`/preempt/run`, data).then((r) => r.data),
-  whoAmI: (params) => http.get(`/preempt/who-am-i`, { params }).then((r) => r.data),
+  // Feature Priority v2 — pure username-based, no SGE, on-demand only
+  listFeaturePriorities: () =>
+    http.get(`/feature-priorities`).then((r) => r.data),
+  upsertFeaturePriority: (data) =>
+    http.put(`/feature-priorities`, data).then((r) => r.data),
+  deleteFeaturePriority: (id) =>
+    http.delete(`/feature-priorities/${id}`).then((r) => r.data),
+  requestFeatureSeat: (data) =>
+    http.post(`/feature-priorities/request`, data).then((r) => r.data),
 
   // expiry / settings / alerts
   expiry: (warn_days = 90) =>
@@ -143,8 +135,6 @@ export const api = {
   saveSettings: (data) => http.put(`/settings`, data).then((r) => r.data),
   testEmail: () => http.post(`/settings/test-email`).then((r) => r.data),
   testWebhook: () => http.post(`/settings/test-webhook`).then((r) => r.data),
-  preemptAutoStatus: () => http.get(`/preempt/auto-status`).then((r) => r.data),
-  preemptAutoTick: () => http.post(`/preempt/auto-tick`).then((r) => r.data),
   listAlerts: (limit = 50) =>
     http.get(`/alerts`, { params: { limit } }).then((r) => r.data),
   evaluateAlerts: () => http.post(`/alerts/evaluate`).then((r) => r.data),

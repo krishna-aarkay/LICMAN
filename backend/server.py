@@ -1729,6 +1729,236 @@ async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dic
     return {"ok": ok, "message": f"lmremove issued for {payload.feature}", "exec": exec_log}
 
 
+# ========================================================================
+# Feature-Priority model (clean v2 — pure username-based, no SGE)
+# ========================================================================
+# One document per (server_id, feature). Two flat user lists. When a user
+# in `hipri_users` requests the feature, the lowest-priority lopri holder
+# is preempted via lmremove and the request succeeds.
+
+class FeaturePriority(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    server_id: str
+    feature: str
+    hipri_users: List[str] = []
+    lopri_users: List[str] = []
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class FeaturePriorityUpsert(BaseModel):
+    server_id: str
+    feature: str
+    hipri_users: List[str] = []
+    lopri_users: List[str] = []
+
+
+class FeatureRequestPayload(BaseModel):
+    server_id: str
+    feature: str
+    user: str
+
+
+def _clean_userlist(xs: List[str]) -> List[str]:
+    """Trim, drop empties, dedupe case-insensitively while preserving first-seen casing."""
+    out: List[str] = []
+    seen: set = set()
+    for x in xs or []:
+        s = (x or "").strip()
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return out
+
+
+@api_router.get("/feature-priorities", response_model=List[FeaturePriority])
+async def list_feature_priorities():
+    return await db.feature_priorities.find({}, {"_id": 0}).sort("feature", 1).to_list(1000)
+
+
+@api_router.put("/feature-priorities", response_model=FeaturePriority)
+async def upsert_feature_priority(payload: FeaturePriorityUpsert,
+                                  _: dict = Depends(require_admin)):
+    if not payload.server_id or not payload.feature.strip():
+        raise HTTPException(400, "server_id and feature are required")
+    # Validate server + feature exist
+    srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0})
+    if not srv:
+        raise HTTPException(404, "Server not found")
+    feat = next((f for f in (srv.get("features") or [])
+                 if f["name"] == payload.feature.strip()), None)
+    if not feat:
+        raise HTTPException(404, f"Feature '{payload.feature}' not found on {srv['name']}")
+
+    hipri = _clean_userlist(payload.hipri_users)
+    lopri = _clean_userlist(payload.lopri_users)
+    # Reject overlap — a user cannot be in both groups for the same feature
+    overlap = sorted({u.lower() for u in hipri} & {u.lower() for u in lopri})
+    if overlap:
+        raise HTTPException(
+            400, f"User(s) appear in both hipri and lopri lists: {', '.join(overlap)}"
+        )
+
+    existing = await db.feature_priorities.find_one(
+        {"server_id": payload.server_id, "feature": payload.feature.strip()},
+        {"_id": 0},
+    )
+    doc = {
+        "id": existing["id"] if existing else str(uuid.uuid4()),
+        "server_id": payload.server_id,
+        "feature": payload.feature.strip(),
+        "hipri_users": hipri,
+        "lopri_users": lopri,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.feature_priorities.update_one(
+        {"server_id": payload.server_id, "feature": payload.feature.strip()},
+        {"$set": doc},
+        upsert=True,
+    )
+    await log_audit(
+        "FEATURE_PRIORITY_SAVE",
+        f"Saved priority groups for {doc['feature']} on {srv['name']} "
+        f"(hipri={len(hipri)}, lopri={len(lopri)})",
+        payload.server_id, srv["name"], "info",
+    )
+    return doc
+
+
+@api_router.delete("/feature-priorities/{fp_id}")
+async def delete_feature_priority(fp_id: str, _: dict = Depends(require_admin)):
+    res = await db.feature_priorities.find_one_and_delete({"id": fp_id}, projection={"_id": 0})
+    if not res:
+        raise HTTPException(404, "Feature priority not found")
+    await log_audit(
+        "FEATURE_PRIORITY_DELETE",
+        f"Deleted priority groups for {res['feature']}",
+        res.get("server_id"), None, "warning",
+    )
+    return {"ok": True}
+
+
+@api_router.post("/feature-priorities/request")
+async def request_feature_seat(payload: FeatureRequestPayload,
+                               admin: dict = Depends(require_admin)):
+    """A user from the high-priority group requests a seat on a feature.
+
+    Outcomes:
+      - available           : seats free, user can check out normally
+      - already_holding     : user already holds a seat
+      - preempted           : a lopri holder was killed, user can now check out
+      - no_victim           : feature saturated but no lopri holder to kill
+      - not_hipri (403)     : requester is not in the hipri list for this feature
+      - no_priority_config (404)
+    """
+    user = (payload.user or "").strip()
+    feature = (payload.feature or "").strip()
+    if not user or not feature:
+        raise HTTPException(400, "user and feature are required")
+
+    fp = await db.feature_priorities.find_one(
+        {"server_id": payload.server_id, "feature": feature}, {"_id": 0}
+    )
+    if not fp:
+        raise HTTPException(
+            404, f"No priority groups configured for '{feature}'. "
+                 f"Add hipri/lopri users on the Priority page first.",
+        )
+
+    hipri_lower = {u.lower() for u in fp.get("hipri_users", [])}
+    lopri_lower = {u.lower() for u in fp.get("lopri_users", [])}
+    if user.lower() not in hipri_lower:
+        raise HTTPException(
+            403, f"User '{user}' is not in the HIGH-PRIORITY group for '{feature}'. "
+                 f"Only hipri users may trigger preemption.",
+        )
+
+    srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0})
+    if not srv:
+        raise HTTPException(404, "Server not found")
+    feat = next((f for f in (srv.get("features") or []) if f["name"] == feature), None)
+    if not feat:
+        raise HTTPException(404, f"Feature '{feature}' not on this server")
+
+    holders = await db.checkouts.find(
+        {"server_id": payload.server_id, "feature": feature}, {"_id": 0}
+    ).to_list(500)
+    used = sum(int(h.get("count") or 1) for h in holders)
+    total = int(feat.get("total") or 0)
+
+    if any(h.get("user", "").lower() == user.lower() for h in holders):
+        return {
+            "ok": True, "action": "already_holding",
+            "feature": feature, "server": srv["name"], "user": user,
+            "message": f"'{user}' already holds a seat for {feature}.",
+        }
+
+    if used < total:
+        return {
+            "ok": True, "action": "available",
+            "feature": feature, "server": srv["name"], "user": user,
+            "seats_free": total - used, "seats_total": total,
+            "message": f"{total - used} seat(s) free — '{user}' can check out {feature} now.",
+        }
+
+    # Saturated — find a lopri victim
+    victims = [
+        h for h in holders
+        if h.get("user", "").lower() in lopri_lower
+    ]
+    if not victims:
+        return {
+            "ok": False, "action": "no_victim",
+            "feature": feature, "server": srv["name"], "user": user,
+            "current_holders": [
+                {"user": h.get("user"), "host": h.get("host"),
+                 "is_lopri": h.get("user", "").lower() in lopri_lower,
+                 "is_hipri": h.get("user", "").lower() in hipri_lower}
+                for h in holders
+            ],
+            "message": (
+                f"{used}/{total} seats held — none of the holders are in the LOW-PRIORITY group. "
+                f"Cannot preempt. Add holders to the lopri list or wait for a natural release."
+            ),
+        }
+
+    # Pick oldest lopri checkout
+    victim = sorted(victims, key=lambda h: h.get("checkout_time", "") or "")[0]
+    kill_payload = KillCheckoutPayload(
+        feature=feature,
+        user=victim.get("user", ""),
+        host=victim.get("host", ""),
+        display=(victim.get("display") or ""),
+    )
+    try:
+        kr = await kill_checkout(payload.server_id, kill_payload, admin)
+    except HTTPException as e:
+        raise HTTPException(500, f"Preempt failed: {e.detail}")
+
+    await log_audit(
+        "PRIORITY_PREEMPT",
+        f"'{user}' (hipri) requested '{feature}' → preempted "
+        f"'{victim.get('user')}@{victim.get('host')}' (lopri) on {srv['name']}",
+        payload.server_id, srv["name"], "warning",
+    )
+    return {
+        "ok": True, "action": "preempted",
+        "feature": feature, "server": srv["name"], "user": user,
+        "preempted_user": victim.get("user"),
+        "preempted_host": victim.get("host"),
+        "exec": kr.get("exec"),
+        "message": (
+            f"Preempted '{victim.get('user')}@{victim.get('host')}'. "
+            f"'{user}' can now check out '{feature}'."
+        ),
+    }
+
+
+
 @api_router.post("/servers/{server_id}/toggle")
 async def toggle_status(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
@@ -3693,16 +3923,17 @@ async def startup_event():
     # Start auto-sync loop
     if os.environ.get("SYNC_INTERVAL_SECONDS", "60") != "0":
         _sync_task = asyncio.create_task(_periodic_sync_loop())
-    # Start auto-preempt loop (no-op until enabled in Settings)
-    global _preempt_task
-    if os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30") != "0":
-        _preempt_task = asyncio.create_task(_auto_preempt_loop())
+    # NOTE: auto-preempt background loop is intentionally DISABLED in v2.
+    # Preemption is now strictly on-demand via POST /api/feature-priorities/request.
+    # The old _auto_preempt_loop / _heuristic_preempt_candidates code is dead
+    # but kept in-file to avoid touching unrelated endpoints during the
+    # refactor — it will be removed in a follow-up cleanup.
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    global _sync_task, _preempt_task
-    for t in (_sync_task, _preempt_task):
+    global _sync_task
+    for t in (_sync_task,):
         if t and not t.done():
             t.cancel()
             try:

@@ -1,0 +1,40 @@
+{
+  "summary": "Iteration 14 — Validated the CLEAN v2 Feature-Priority rebuild (per-feature hipri/lopri user groups, on-demand preemption, no SGE, no background daemon). Backend: 19/19 pytest cases PASS — full CRUD + idempotency + overlap-rejection + unknown server/feature 404 + all 6 /request branches (available, already_holding, preempted [oldest lopri victim, db.checkouts row removed], no_victim-neutral, no_victim-all-hipri, not_in_hipri 403, no_priority_config 404) + role-gating (engineer 403 on PUT/DELETE/POST, 200 on GET) + startup invariant (Auto-preempt loop NOT started, only Auto-sync). Frontend: 7/7 critical flows PASS on the live preview URL — /priority renders with priority-page/title/request-license-panel/priority-configs-section; ADD FEATURE flow (add-feature-priority-btn → editor → server select + feature input + hipri/lopri textareas → save-edit-btn → new config-row visible); EDIT flow (edit-config-<id> opens pre-filled editor → modify hipri → save → row reflects update); DELETE flow (delete-config-<id> + confirm accept → row removed); pill-hi-pri-<user> quick-fill auto-populates req-server/req-feature/req-user; REQUEST result card renders for both success and 403 paths with red 'error' tone and detail; /settings loads cleanly (zero page errors, SGE and auto-preempt toggles absent, DEPRECATED placeholder present).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration14.py",
+    "/app/test_reports/pytest/iteration14.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 3944 lines — file size has grown significantly across iterations and remains far above the 700-line guideline. The old auto-preempt loop / heuristic candidate code is deliberately dead-but-still-in-file per the comment at line ~3926. Recommend a follow-up PR that (a) deletes the dead _auto_preempt_loop and _heuristic_preempt_candidates, (b) removes the deprecated /api/priority-rules, /api/preempt/*, /api/pending-requests/*, /api/license/request endpoints called out as deprecated, and (c) extracts feature-priority code into /app/backend/feature_priority.py.",
+    "request_feature_seat() at server.py:1845 calls kill_checkout() (itself an endpoint) and catches HTTPException to re-raise as 500. The cleaner pattern is to extract a private async _run_lmremove(srv, feature, user, host, display) helper used by both endpoints — currently endpoint-to-endpoint reuse couples request-lifecycle concerns (Depends, audit, etc.).",
+    "edit-feature input in Priority.jsx uses an <input list=...> datalist autocomplete rather than a strict <select>. UX-wise this lets admins type ANY string; only the backend rejects unknown features (404). Consider validating client-side against the chosen server's feature list before enabling SAVE to give immediate feedback.",
+    "/api/feature-priorities GET is NOT role-gated — any authenticated user can enumerate hipri/lopri usernames per feature. This is consistent with the previous /api/priority-rules behaviour (also un-gated) but minor info-leak. Acceptable given the page itself is admin-only, but worth documenting.",
+    "_clean_userlist dedupes case-insensitively but preserves first-seen casing. The overlap check then re-lowercases on its own — fine, but consider storing the canonical lowercased form to remove ambiguity when comparing against checkout users (which use their original casing).",
+    "The old deprecated /api/preempt/auto-status and /api/preempt/auto-tick endpoints still exist and respond. UI no longer surfaces them but they should be removed (or at minimum return 410 Gone) in a cleanup pass to prevent accidental re-use."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration14.py (new — 19 tests across 4 classes)",
+    "/app/test_reports/pytest/iteration14.xml (new — junit results)",
+    "/app/test_reports/iteration_14.json (new)"
+  ],
+  "success_rate": {
+    "backend": "19/19 (100%) — CRUD + role-gating + all 6 /request branches + startup invariant",
+    "frontend": "7/7 (100%) — page render, ADD, EDIT, DELETE, pill quick-fill, REQUEST happy + 403, Settings clean load"
+  },
+  "test_credentials": "admin@example.com / adminpass123 (from /app/memory/test_credentials.md). Engineer-role user TEST_eng_iter14@example.com / EngPass!2026 created idempotently for 403 tests.",
+  "seed_data_creation": "Backend tests temporarily insert/delete checkouts on cadence-prod-01/Innovus and feature_priorities for Innovus/Tempus — each test cleans up its own writes. Frontend test creates a UI_hi_user1/UI_hi_user2 hipri + UI_lo_user1/UI_lo_user2 lopri config on Innovus, then deletes it via the DELETE flow. Post-run sweep removes any residual Innovus/Tempus configs and UI_* / TEST_* checkouts. Final DB state: only the original 'Genus' priority config remains.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All v2 Feature-Priority endpoints and UI flows are GREEN. Reusable harness at /app/backend/tests/test_iteration14.py uses requests.Session cookie auth and direct pymongo writes to set up saturation scenarios. UI testids confirmed: priority-page, priority-title, request-license-panel, priority-configs-section, add-feature-priority-btn, priority-editor, edit-server (SELECT), edit-feature (INPUT+datalist), edit-hipri (textarea), edit-lopri (textarea), save-edit-btn, cancel-edit-btn, close-editor, config-row-<id>, edit-config-<id>, delete-config-<id>, pill-hi-pri-<user>, pill-lo-pri-<user>, req-server (SELECT), req-feature (INPUT+datalist), req-user (input), submit-request-btn, request-result-card. NOTE: edit-feature and req-feature are INPUTS (with datalist autocomplete), NOT selects — use page.fill()/type() not select_option(). page.fill() on input + page.click(triple)+keyboard.delete+page.type works reliably; the existing controlled-input quirk seen in iter9 does NOT apply here (no dirty-flag guard). Auto-preempt background loop confirmed OFF in latest startup logs.",
+  "rca_of_the_issue": "N/A — no production bugs found. One minor adjustment during testing: switched from page.select_option to page.fill for edit-feature/req-feature because they are <input list=...> datalist combos rather than <select> dropdowns; this is a deliberate UX choice (free-text feature name to match server-side validation), not a bug."
+}
