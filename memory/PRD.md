@@ -132,6 +132,66 @@ in "*?["): continue`). The user's rules use wildcards (`rakella*`,
   saturated Calibre_DRC; 19 skip reasons surfaced for other rule/feature
   pairs that were not saturated.
 
+## Iteration 15 — Clean Priority Dashboard v2 (per-feature hipri/lopri) — 2026-06
+
+**User request** (verbatim):
+> Remove existing priority complete dashboard. Start a clean dashboard.
+> My requirement is to build priority based on username (No SGE dependent).
+> Where high priority group of users and low priority group of users
+> to added on the dashboard. For every feature there should be these two
+> groups. When user from high priority group request a license then only
+> it should kill the license from low priority group and assign to the user.
+
+**Implementation**:
+
+### New backend collection `feature_priorities` + endpoints
+- `GET  /api/feature-priorities` — list configs
+- `PUT  /api/feature-priorities` — upsert by (server_id, feature). Validates
+  server + feature exist, rejects user-overlap between hipri/lopri groups.
+- `DELETE /api/feature-priorities/{id}` — admin only
+- `POST /api/feature-priorities/request` — body `{server_id, feature, user}`.
+  Returns one of six outcomes:
+    - `available` — seats free, no preempt needed
+    - `already_holding` — requester already owns a seat
+    - `preempted` — killed oldest lopri holder via lmremove, requester can
+      now check out
+    - `no_victim` (ok=false) — saturated but no lopri holder to kill
+    - 403 `not_in_hipri` — requester not in the hipri group
+    - 404 `no_priority_config` — no config exists for that feature
+
+### Frontend rewrite — `/app/frontend/src/pages/Priority.jsx`
+Completely rebuilt from scratch. Three sections:
+1. **REQUEST LICENSE panel** — server + feature + user inputs, big REQUEST
+   button, result card with `available` / `preempted` / `no_victim` /
+   `error` tones and audit detail (`exec.command`, `exec.output`).
+2. **FEATURE PRIORITY CONFIGS list** — one row per (server, feature):
+   server name, feature name, total seats, HI-PRI pills (emerald,
+   click-to-quickfill-request), LO-PRI pills (red), edit/delete buttons.
+3. **Editor** — server dropdown + feature input (with datalist autocomplete
+   from the server's actual features) + hipri textarea + lopri textarea.
+
+### Removed / disabled
+- Auto-preempt background loop **no longer starts** at boot (was
+  `_auto_preempt_loop`). Preemption is strictly on-demand via REQUEST.
+- Settings page lost the "SGE" and "AUTO-PREEMPTION DAEMON" panels — only
+  a `DEPRECATED` placeholder remains for the SGE section.
+- `api.js` cleared the obsolete helpers (`listPriorityRules`,
+  `preemptPlan`, `preemptRun`, `listPendingRequests`, `preemptAutoTick`,
+  etc.) and added `listFeaturePriorities`, `upsertFeaturePriority`,
+  `deleteFeaturePriority`, `requestFeatureSeat`.
+
+### Testing
+- 19/19 backend pytest (new `/app/backend/tests/test_iteration14.py`)
+- 7/7 frontend Playwright flows
+- Auto-preempt loop confirmed OFF in startup logs
+- See `/app/test_reports/iteration_14.json`
+
+### Tech debt deliberately deferred
+- The old `/api/priority-rules`, `/api/preempt/*`, `/api/pending-requests/*`,
+  `/api/license/request` endpoints are dead code but still in `server.py`.
+  Removing them is a separate cleanup PR (no UI consumers remain).
+- `server.py` is now 3944 lines. Splitting into `routes/` is overdue.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.
