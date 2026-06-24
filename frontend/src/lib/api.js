@@ -124,6 +124,10 @@ export const api = {
     http.delete(`/feature-priorities/${id}`).then((r) => r.data),
   requestFeatureSeat: (data) =>
     http.post(`/feature-priorities/request`, data).then((r) => r.data),
+  featurePriorityAutoStatus: () =>
+    http.get(`/feature-priorities/auto-status`).then((r) => r.data),
+  featurePriorityAutoTick: () =>
+    http.post(`/feature-priorities/auto-tick`).then((r) => r.data),
 
   // expiry / settings / alerts
   expiry: (warn_days = 90) =>

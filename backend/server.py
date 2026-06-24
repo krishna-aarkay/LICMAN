@@ -1959,6 +1959,185 @@ async def request_feature_seat(payload: FeatureRequestPayload,
 
 
 
+# ─────────────── Auto-preempt background loop (v2 — hipri/lopri based) ───────────────
+# Periodically scans every feature_priority config. For each one, if the
+# feature is saturated AND at least one holder is in lopri AND no hipri user
+# currently holds a seat AND no hipri user has held a seat in the recent past
+# (we don't auto-preempt unless we have reason to believe a hipri user wants
+# in), we DON'T preempt — there's no implicit request signal here. So the
+# auto-loop only acts when the admin has added someone to a *new* "auto-
+# request" mechanism: see _auto_preempt_signals below.
+#
+# The cleanest auto-preempt signal in pure-username land is:
+#   "Whenever a hipri user is denied a seat (feature saturated, all holders
+#    are non-hipri), proactively free a seat for them by killing the oldest
+#    lopri holder."
+# We detect this by watching db.checkouts for hipri users who suddenly
+# disappear (their tool retried and got blocked) — but lmstat doesn't expose
+# denied attempts. The pragmatic alternative used here:
+#
+#   "Whenever a feature is saturated AND there is at least one lopri holder
+#    AND there is at least one hipri user listed in the config who is NOT
+#    currently holding a seat → preempt one lopri holder to keep a seat warm
+#    for them."
+# This matches what users normally mean by "automatic" — hipri users get
+# pre-emptive headroom, lopri users get bumped when seats are tight.
+
+_preempt_task: Optional[asyncio.Task] = None
+
+
+async def _auto_preempt_tick_v2() -> dict:
+    """One iteration. Returns a summary dict for logging / the admin endpoint."""
+    configs = await db.feature_priorities.find({}, {"_id": 0}).to_list(2000)
+    if not configs:
+        return {"scanned": 0, "actioned": 0, "results": [], "reasons": []}
+
+    fake_admin = {"role": "admin", "email": "auto-preempt@licman"}
+    actioned = 0
+    results: List[dict] = []
+    reasons: List[dict] = []
+    # Don't preempt the same (server, feature) twice in one tick
+    freed: set = set()
+
+    for cfg in configs:
+        feature = cfg["feature"]
+        server_id = cfg["server_id"]
+        hipri_set = {u.lower() for u in cfg.get("hipri_users", [])}
+        lopri_set = {u.lower() for u in cfg.get("lopri_users", [])}
+        if not hipri_set or not lopri_set:
+            reasons.append({"feature": feature, "skip": "empty_hipri_or_lopri"})
+            continue
+        if (server_id, feature) in freed:
+            continue
+
+        srv = await db.servers.find_one({"id": server_id}, {"_id": 0})
+        if not srv:
+            reasons.append({"feature": feature, "skip": "server_missing"})
+            continue
+        feat = next((f for f in (srv.get("features") or [])
+                     if f["name"] == feature), None)
+        if not feat:
+            reasons.append({"feature": feature, "skip": "feature_missing_on_server"})
+            continue
+
+        holders = await db.checkouts.find(
+            {"server_id": server_id, "feature": feature}, {"_id": 0}
+        ).to_list(500)
+        used = sum(int(h.get("count") or 1) for h in holders)
+        total = int(feat.get("total") or 0)
+        if total <= 0 or used < total:
+            reasons.append({
+                "feature": feature, "server": srv["name"],
+                "skip": "not_saturated", "used": used, "total": total,
+            })
+            continue
+
+        # If ANY hipri user is already holding a seat, the rule is satisfied;
+        # don't kill another lopri unnecessarily.
+        if any(h.get("user", "").lower() in hipri_set for h in holders):
+            reasons.append({
+                "feature": feature, "server": srv["name"],
+                "skip": "hipri_already_holds_seat",
+            })
+            continue
+
+        # Find oldest lopri victim
+        lopri_holders = [h for h in holders if h.get("user", "").lower() in lopri_set]
+        if not lopri_holders:
+            reasons.append({
+                "feature": feature, "server": srv["name"],
+                "skip": "no_lopri_victim",
+                "current_holders": [h.get("user") for h in holders],
+            })
+            continue
+        victim = sorted(lopri_holders,
+                        key=lambda h: h.get("checkout_time", "") or "")[0]
+
+        kp = KillCheckoutPayload(
+            feature=feature, user=victim.get("user", ""),
+            host=victim.get("host", ""), display=(victim.get("display") or ""),
+        )
+        try:
+            kr = await kill_checkout(server_id, kp, fake_admin)
+            actioned += 1
+            freed.add((server_id, feature))
+            results.append({
+                "feature": feature, "server": srv["name"],
+                "preempted_user": victim.get("user"),
+                "preempted_host": victim.get("host"),
+                "outcome": "preempted",
+                "hipri_pool": sorted(hipri_set),
+                "exec": kr.get("exec"),
+            })
+            await log_audit(
+                "AUTO_PREEMPT_V2",
+                f"Auto-released '{victim.get('user')}@{victim.get('host')}' "
+                f"(lopri) on '{feature}' to keep a seat available for hipri "
+                f"pool {sorted(hipri_set)} (server={srv['name']})",
+                server_id, srv["name"], "warning",
+            )
+        except HTTPException as e:
+            results.append({"feature": feature, "server": srv["name"],
+                            "outcome": f"error: {e.detail}"})
+        except Exception as e:
+            results.append({"feature": feature, "server": srv["name"],
+                            "outcome": f"error: {str(e)[:120]}"})
+
+    return {
+        "scanned": len(configs),
+        "actioned": actioned,
+        "results": results,
+        "reasons": reasons,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _auto_preempt_loop_v2():
+    interval_env = int(os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30"))
+    if interval_env <= 0:
+        logger.info("Auto-preempt v2 loop disabled (AUTO_PREEMPT_INTERVAL_SECONDS=0)")
+        return
+    logger.info(f"Auto-preempt v2 loop started — interval {interval_env}s")
+    while True:
+        try:
+            cfg = await get_alert_settings()
+            if cfg.get("auto_preempt_enabled"):
+                summary = await _auto_preempt_tick_v2()
+                if summary["actioned"]:
+                    logger.info(
+                        f"auto-preempt v2: actioned {summary['actioned']} of "
+                        f"{summary['scanned']} feature(s)"
+                    )
+        except Exception as e:
+            logger.warning(f"auto-preempt v2 loop error: {e}")
+        cfg = await get_alert_settings()
+        rt_interval = int(cfg.get("auto_preempt_interval_sec") or interval_env)
+        await asyncio.sleep(max(10, rt_interval))
+
+
+@api_router.post("/feature-priorities/auto-tick")
+async def feature_priority_auto_tick_now(_: dict = Depends(require_admin)):
+    """Force one auto-preempt iteration on demand. Returns the same summary
+    the background loop would produce. Useful for testing rules / diagnosing
+    why nothing was actioned (look at the 'reasons' array)."""
+    return await _auto_preempt_tick_v2()
+
+
+@api_router.get("/feature-priorities/auto-status")
+async def feature_priority_auto_status():
+    cfg = await get_alert_settings()
+    running = bool(_preempt_task and not _preempt_task.done())
+    return {
+        "running": running,
+        "enabled_in_settings": bool(cfg.get("auto_preempt_enabled")),
+        "interval_sec": int(
+            cfg.get("auto_preempt_interval_sec")
+            or os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30")
+        ),
+    }
+
+
+
 @api_router.post("/servers/{server_id}/toggle")
 async def toggle_status(server_id: str):
     doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
@@ -3364,9 +3543,9 @@ async def _periodic_sync_loop():
         await asyncio.sleep(interval)
 
 
-# ---------- Auto-preemption background loop ----------
-
-_preempt_task: Optional[asyncio.Task] = None
+# ---------- Auto-preemption background loop (LEGACY — replaced by v2 above) ----------
+# The old SGE-aware loop and helpers below are dead code. Kept in-file
+# temporarily; tracked for removal in a cleanup PR. Do NOT add new code here.
 
 
 async def _sge_get_pending_license_requests() -> List[dict]:
@@ -3923,17 +4102,16 @@ async def startup_event():
     # Start auto-sync loop
     if os.environ.get("SYNC_INTERVAL_SECONDS", "60") != "0":
         _sync_task = asyncio.create_task(_periodic_sync_loop())
-    # NOTE: auto-preempt background loop is intentionally DISABLED in v2.
-    # Preemption is now strictly on-demand via POST /api/feature-priorities/request.
-    # The old _auto_preempt_loop / _heuristic_preempt_candidates code is dead
-    # but kept in-file to avoid touching unrelated endpoints during the
-    # refactor — it will be removed in a follow-up cleanup.
+    # Start the v2 auto-preempt loop (no-op unless auto_preempt_enabled=true in Settings)
+    global _preempt_task
+    if os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30") != "0":
+        _preempt_task = asyncio.create_task(_auto_preempt_loop_v2())
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    global _sync_task
-    for t in (_sync_task,):
+    global _sync_task, _preempt_task
+    for t in (_sync_task, _preempt_task):
         if t and not t.done():
             t.cancel()
             try:

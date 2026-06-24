@@ -330,6 +330,54 @@ export default function Settings() {
                 daemon, no qstat polling.
               </div>
             </Panel>
+
+            <Panel title="AUTO-PREEMPT DAEMON" icon={Crown}>
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-mono text-[10px] text-[#9ca3af] flex-1 pr-4">
+                  Background loop that walks every saved <span className="text-emerald-400">feature-priority</span> config and{" "}
+                  <span className="text-amber-400">proactively preempts</span> one lopri holder whenever a feature is fully checked out and{" "}
+                  <span className="text-emerald-400">no hipri user</span> currently holds a seat.
+                  Triggered purely off the hipri / lopri lists you maintain on the Priority page — no SGE, no scheduler.
+                </div>
+                <button
+                  className="btn-brutal flex items-center gap-1.5 text-[10px] py-1"
+                  onClick={async () => {
+                    try {
+                      const r = await api.featurePriorityAutoTick();
+                      toast.success(
+                        `Tick complete · scanned ${r.scanned} feature(s) · actioned ${r.actioned}`,
+                      );
+                    } catch (e) {
+                      toast.error(e?.response?.data?.detail || "Tick failed");
+                    }
+                  }}
+                  disabled={!cfg.auto_preempt_enabled}
+                  data-testid="auto-preempt-tick-btn"
+                >
+                  <Send size={11} /> RUN TICK NOW
+                </button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <Field label="Interval (seconds, min 10)">
+                  <input
+                    type="number" min={10} max={600}
+                    value={cfg.auto_preempt_interval_sec || 30}
+                    onChange={(e) => upd({ auto_preempt_interval_sec: Number(e.target.value) || 30 })}
+                    className="inp tabular-nums"
+                    data-testid="auto-preempt-interval"
+                  />
+                </Field>
+                <div className="md:col-span-2">
+                  <Toggle
+                    label="Auto-preempt Daemon Enabled"
+                    value={cfg.auto_preempt_enabled}
+                    onChange={(v) => upd({ auto_preempt_enabled: v })}
+                    testid="auto-preempt-enabled"
+                    wrapperTestid="auto-preempt-enabled-toggle"
+                  />
+                </div>
+              </div>
+            </Panel>
           </section>
 
           {/* Alerts log */}

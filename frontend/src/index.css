@@ -209,6 +209,50 @@ select {
     font-family: "JetBrains Mono", monospace;
 }
 
+/* Shared text-input style used across Login, Priority, Settings, etc. */
+.inp {
+    width: 100%;
+    background: #0a0a0a;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    font-size: 12px;
+    font-family: "JetBrains Mono", monospace;
+    border-radius: 2px;
+    transition: border-color 100ms, background 100ms;
+    outline: none;
+}
+.inp::placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+.inp:focus {
+    border-color: var(--c-success);
+    background: #0e0e0e;
+}
+.inp:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+textarea.inp {
+    line-height: 1.4;
+    resize: vertical;
+}
+select.inp {
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: linear-gradient(45deg, transparent 50%, #6b7280 50%),
+        linear-gradient(135deg, #6b7280 50%, transparent 50%);
+    background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+    padding-right: 26px;
+}
+select.inp option {
+    background: #0a0a0a;
+    color: var(--text);
+}
+
 /* Hide visual edit chrome overflow noise */
 [data-debug-wrapper="true"] {
     display: contents !important;

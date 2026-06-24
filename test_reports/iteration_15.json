@@ -1,0 +1,40 @@
+{
+  "summary": "Iteration 15 — Validated the new auto-preempt v2 BACKGROUND DAEMON (feature_priorities-driven, no SGE) and the CSS .inp visible-text fix. Backend: 12/12 pytest cases PASS — regression smoke (list/upsert+delete/request still OK), GET /api/feature-priorities/auto-status returns {running, enabled_in_settings, interval_sec}, POST /api/feature-priorities/auto-tick is admin-only (anon → 401), returns correct {scanned, actioned, results, reasons, ts} shape, preempts the OLDEST lopri holder (verified victim user matches AND db.checkouts row removed), correctly SKIPS with reason 'hipri_already_holds_seat' when a hipri user is already a holder, never preempts the same (server,feature) twice in a single tick, the background loop actively preempts a freshly-saturated all-lopri config within ~10-30s when auto_preempt_enabled=true (interval 10s), and is a true no-op for 15s when auto_preempt_enabled=false. Frontend: 7/7 critical checks PASS — login, /priority loads, [data-testid=auto-preempt-status] banner renders ('DAEMON: RUNNING · TOGGLE: ENABLED · INTERVAL: 10s'), .inp CSS class renders LIGHT-GREY-ON-BLACK (color rgb(243,244,246) on bg rgb(10,10,10)) for edit-feature, edit-hipri, edit-lopri AND req-user — typed values match input_value() exactly so the invisible-text regression is fixed; [data-testid=auto-tick-now-btn] fires POST /api/feature-priorities/auto-tick and renders [data-testid=last-tick-diag] with RESULTS + SKIP REASONS cards; Settings AUTO-PREEMPT DAEMON panel is back with interval input, ON/OFF toggle, and RUN TICK NOW button that calls api.featurePriorityAutoTick() (status 200, NOT the legacy /preempt/auto-tick endpoint).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration15.py",
+    "/app/test_reports/pytest/iteration15.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is still 4122 lines — the DEAD legacy auto_preempt loop (`_auto_preempt_loop` / `_auto_preempt_tick`) at lines 3838-3956 and the deprecated `/api/preempt/auto-tick` + `/api/preempt/auto-status` endpoints at 3960-3977 are STILL live in the router even though the new v2 endpoints completely supersede them. They should be deleted (or return 410 Gone) in a cleanup pass; right now an old client could still hit them, and grep-driven maintenance is confusing because both `_auto_preempt_tick` and `_auto_preempt_tick_v2` exist.",
+    "There is light coupling between auto-sync (`_periodic_sync_loop`, adapter_mode=='ssh' only) and the v2 preempt loop on real (non-mock) servers — if a sync overwrites db.checkouts (line 3531 `delete_many`) mid-tick, the preempt loop may observe a transient empty checkout list and skip with 'not_saturated' even when the saturated state is real. Consider serialising sync and preempt under a per-server lock, or have the preempt loop pin the holder list at the start of evaluation and recheck once.",
+    "/api/feature-priorities/auto-status is NOT role-gated — any authenticated user can see whether the daemon is running and the interval. Consistent with /api/feature-priorities GET (same comment last iteration). Acceptable info-leak but worth a one-line @require_admin or doc note.",
+    "The v2 loop hard-codes `await asyncio.sleep(max(10, rt_interval))` (line 2115). Admins setting interval_sec<10 in /api/settings will be silently clamped — UI doesn't surface this. Either reject <10 in AlertSettings validation (Pydantic ge=10) or render a warning under the interval input.",
+    "_set_auto in PUT /api/settings round-trips smtp_password as masked '********' — testers had to scrub it manually before PUT or it would be persisted literally. Backend should ignore `smtp_password == '********'` (treat as 'no change') on PUT.",
+    "Frontend /priority page banner & Settings panel both poll auto-status — they should share a single hook/store to avoid double network calls when both pages are open in tabs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration15.py (new — 12 tests across 4 classes)",
+    "/app/test_reports/pytest/iteration15.xml (new — junit results)",
+    "/app/test_reports/iteration_15.json (new)"
+  ],
+  "success_rate": {
+    "backend": "12/12 (100%) — smoke regression + auto-status + on-demand auto-tick (admin-gating, summary shape, oldest-lopri preemption, hipri-skip, one-per-tick) + background loop (preempts when enabled, no-op when disabled)",
+    "frontend": "7/7 (100%) — login, /priority load, auto-preempt-status banner, .inp visible text (edit-feature/hipri/lopri/req-user, color rgb(243,244,246) on bg rgb(10,10,10)), auto-tick-now-btn API integration + last-tick-diag render, Settings AUTO-PREEMPT DAEMON panel + RUN TICK NOW button"
+  },
+  "test_credentials": "admin@example.com / adminpass123 (from /app/memory/test_credentials.md).",
+  "seed_data_creation": "Backend tests temporarily insert/delete db.checkouts for cadence-prod-01 Innovus (TEST_lo1..TEST_lo8 + TEST_hi1 / TEST_bgN / TEST_noN) and feature_priorities for Innovus — each test cleans up its own writes in a try/finally. Final DB state restored: original seeded Genus priority config remains, daemon left ENABLED with interval=10s. Note: backend uses DB_NAME='test_database' (from backend/.env), NOT 'licman' — initial test version had a wrong DB and showed phantom 'used=5' which was actually the auto-seeded mock checkouts in test_database; fixed by reading DB_NAME from backend/.env.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All iter15 deliverables (CSS .inp fix + auto-preempt v2 daemon) are GREEN. Reusable harness at /app/backend/tests/test_iteration15.py uses requests.Session cookie auth + pymongo direct writes to set up saturation scenarios on cadence-prod-01/Innovus (mock adapter, total=8). Confirmed testids: auto-preempt-status (banner on /priority), auto-tick-now-btn, last-tick-diag, plus all iter14 ids (edit-feature, edit-hipri, edit-lopri, req-user, etc.). .inp class is present at /app/frontend/src/index.css:213 (NOT wrapped in @layer — still works because Tailwind utilities are loaded before component css). Settings panel reads/writes through PUT /api/settings; tests must scrub smtp_password=='********' before PUT or the masked literal gets saved. Legacy /api/preempt/auto-tick + /api/preempt/auto-status endpoints are still alive in server.py (lines 3960-3977) — UI no longer uses them but they're a deprecation target.",
+  "rca_of_the_issue": "N/A — no production bugs. Two test-only adjustments: (1) the v2 upsert endpoint is PUT /api/feature-priorities, not POST (POST is /request and /auto-tick only); (2) backend DB_NAME comes from backend/.env (='test_database'), not the default 'licman', so the pymongo client in the test must read backend/.env explicitly."
+}

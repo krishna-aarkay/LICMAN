@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Crown, Plus, Trash2, Save, Edit3, Zap, X, RefreshCw,
-  AlertTriangle, CheckCircle2, ShieldAlert,
+  AlertTriangle, CheckCircle2, ShieldAlert, Activity, PlayCircle,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import Header from "@/components/Header";
@@ -45,6 +45,37 @@ export default function Priority() {
   const [reqResult, setReqResult] = useState(null);
   const [requesting, setRequesting] = useState(false);
 
+  // Auto-preempt daemon state
+  const [autoStatus, setAutoStatus] = useState(null);
+  const [tickRunning, setTickRunning] = useState(false);
+  const [lastTick, setLastTick] = useState(null);
+
+  const loadAutoStatus = async () => {
+    try {
+      setAutoStatus(await api.featurePriorityAutoStatus());
+    } catch {
+      /* silent — daemon endpoint optional */
+    }
+  };
+
+  const runTickNow = async () => {
+    setTickRunning(true);
+    try {
+      const r = await api.featurePriorityAutoTick();
+      setLastTick(r);
+      if (r.actioned > 0) {
+        toast.success(`Auto-tick · preempted ${r.actioned} seat(s)`);
+      } else {
+        toast.info(`Auto-tick · scanned ${r.scanned} feature(s) · nothing to do`);
+      }
+      await load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Tick failed");
+    } finally {
+      setTickRunning(false);
+    }
+  };
+
   const load = async () => {
     try {
       const [cfgs, srvs] = await Promise.all([
@@ -60,7 +91,11 @@ export default function Priority() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 15000); // light polling so checkout counts stay live
+    loadAutoStatus();
+    const t = setInterval(() => {
+      load();
+      loadAutoStatus();
+    }, 15000); // light polling so checkout counts + daemon state stay live
     return () => clearInterval(t);
   }, []);
 
@@ -209,6 +244,122 @@ export default function Priority() {
             <Plus size={12} /> ADD FEATURE
           </button>
         </div>
+
+        {/* ─────────── Auto-preempt daemon status strip ─────────── */}
+        <section
+          className="bg-[#111] border border-[#222] rounded-sm flex items-center gap-4 px-4 py-2.5"
+          data-testid="auto-preempt-status"
+        >
+          <Activity
+            size={14}
+            className={autoStatus?.enabled_in_settings ? "text-emerald-400" : "text-[#6b7280]"}
+          />
+          <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#9ca3af]">
+            AUTO-PREEMPT
+          </div>
+          <div className="font-mono text-[11px] flex items-center gap-3">
+            <span>
+              Daemon:{" "}
+              <span className={autoStatus?.running ? "text-emerald-400" : "text-red-400"}>
+                {autoStatus?.running ? "RUNNING" : "STOPPED"}
+              </span>
+            </span>
+            <span className="text-[#6b7280]">·</span>
+            <span>
+              Toggle:{" "}
+              <span className={autoStatus?.enabled_in_settings ? "text-emerald-400" : "text-amber-400"}>
+                {autoStatus?.enabled_in_settings ? "ENABLED" : "DISABLED"}
+              </span>
+            </span>
+            <span className="text-[#6b7280]">·</span>
+            <span>
+              Interval:{" "}
+              <span className="text-white tabular-nums">
+                {autoStatus?.interval_sec ?? "—"}s
+              </span>
+            </span>
+            {lastTick && (
+              <>
+                <span className="text-[#6b7280]">·</span>
+                <span>
+                  Last manual tick:{" "}
+                  <span className="text-white">
+                    actioned {lastTick.actioned}/{lastTick.scanned}
+                  </span>
+                </span>
+              </>
+            )}
+          </div>
+          <button
+            onClick={runTickNow}
+            disabled={tickRunning}
+            className="ml-auto btn-brutal flex items-center gap-1.5 disabled:opacity-50"
+            data-testid="auto-tick-now-btn"
+          >
+            <PlayCircle size={11} /> {tickRunning ? "TICKING…" : "TICK NOW"}
+          </button>
+        </section>
+
+        {/* Last-tick diagnostic card (optional) */}
+        {lastTick && (lastTick.results?.length > 0 || lastTick.reasons?.length > 0) && (
+          <section
+            className="bg-[#111] border border-[#222] rounded-sm p-4 font-mono text-[11px] grid grid-cols-1 md:grid-cols-2 gap-4"
+            data-testid="last-tick-diag"
+          >
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-emerald-400 mb-1.5">
+                RESULTS ({lastTick.results?.length || 0})
+              </div>
+              {(lastTick.results || []).length === 0 && (
+                <div className="text-[#6b7280] italic">// no actions this tick</div>
+              )}
+              <div className="max-h-44 overflow-y-auto space-y-1">
+                {(lastTick.results || []).map((r, i) => (
+                  <div key={i} className="border border-[#1a1a1a] px-2 py-1.5 bg-[#0a0a0a]">
+                    <div className="text-emerald-400 text-[10px] uppercase">{r.outcome}</div>
+                    <div className="text-white">
+                      {r.server} → {r.feature}
+                    </div>
+                    <div className="text-[#9ca3af]">
+                      preempted:{" "}
+                      <span className="text-red-400">
+                        {r.preempted_user}@{r.preempted_host}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-amber-400 mb-1.5">
+                SKIP REASONS ({lastTick.reasons?.length || 0})
+              </div>
+              {(lastTick.reasons || []).length === 0 && (
+                <div className="text-[#6b7280] italic">// no skips</div>
+              )}
+              <div className="max-h-44 overflow-y-auto space-y-1">
+                {(lastTick.reasons || []).map((r, i) => (
+                  <div key={i} className="border border-[#1a1a1a] px-2 py-1.5 bg-[#0a0a0a]">
+                    <div className="text-amber-400 text-[10px] uppercase">{r.skip}</div>
+                    <div className="text-white">
+                      {r.server || "—"} → {r.feature}
+                    </div>
+                    {r.used != null && (
+                      <div className="text-[#9ca3af]">
+                        used={r.used}/total={r.total}
+                      </div>
+                    )}
+                    {r.current_holders && (
+                      <div className="text-[#9ca3af]">
+                        holders=[{(r.current_holders || []).join(", ")}]
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
 
         {/* ─────────── REQUEST LICENSE panel ─────────── */}
         <section
