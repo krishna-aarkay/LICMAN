@@ -192,6 +192,33 @@ Completely rebuilt from scratch. Three sections:
   Removing them is a separate cleanup PR (no UI consumers remain).
 - `server.py` is now 3944 lines. Splitting into `routes/` is overdue.
 
+## Iteration 16 — Input-visibility CSS fix + auto-preempt v2 daemon — 2026-06
+
+**User bug**: Typed text in Priority page inputs (feature, hipri/lopri textareas, request user) was INVISIBLE — `.inp` className referenced by Login/Priority/Settings/etc. was **never defined** in `/app/frontend/src/index.css`, so inputs inherited default browser text color on the dark `#0a0a0a` backgrounds.
+
+**Fix**: Added `.inp` rule + `:focus`, `:disabled`, `::placeholder`, textarea, and select variants in `index.css`. Text now renders in `rgb(243,244,246)` on `rgb(10,10,10)` across the entire app. Latent bug — silently affected Login screen as well.
+
+**User feature request**: Re-enable AUTOMATIC preemption based on the hipri/lopri lists.
+
+**Implementation** — fresh v2 daemon, NO SGE, NO old priority_rules:
+- New helpers `_auto_preempt_tick_v2()` + `_auto_preempt_loop_v2()` in `server.py`.
+- Walks every `feature_priorities` config every N seconds (settings-driven).
+  For each saturated feature where no hipri user holds a seat AND at least
+  one lopri user holds → kill the oldest lopri holder via `lmremove`.
+- New endpoints:
+  - `POST /api/feature-priorities/auto-tick` (admin) — force one iteration on demand
+  - `GET  /api/feature-priorities/auto-status` — running/enabled/interval
+- Reason codes for skipped (feature, server) pairs: `empty_hipri_or_lopri`,
+  `server_missing`, `feature_missing_on_server`, `not_saturated`,
+  `hipri_already_holds_seat`, `no_lopri_victim`.
+- Frontend:
+  - New AUTO-PREEMPT status banner on `/priority` (Activity icon + running/toggle/interval + TICK NOW button)
+  - Optional LAST-TICK DIAGNOSTIC card showing RESULTS + SKIP REASONS for self-debugging
+  - AUTO-PREEMPT DAEMON panel restored to `/settings` (interval input + toggle + RUN TICK NOW)
+- The old SGE / priority_rules / pending_requests endpoints remain dead code (no UI consumers); kept in-file for the cleanup PR.
+
+**Testing**: 12/12 backend + 7/7 frontend in `/app/test_reports/iteration_15.json`. Validated `.inp` color values directly via `page.evaluate(window.getComputedStyle)` and the background loop preempted a freshly-saturated all-lopri config in ~10-30s with interval=10s.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.
