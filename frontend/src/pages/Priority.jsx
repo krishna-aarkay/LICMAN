@@ -280,6 +280,18 @@ export default function Priority() {
                 {autoStatus?.interval_sec ?? "—"}s
               </span>
             </span>
+            <span className="text-[#6b7280]">·</span>
+            <span>
+              Cooldown:{" "}
+              <span className="text-white tabular-nums">
+                {autoStatus?.cooldown_sec ?? "—"}s
+              </span>
+              {autoStatus?.active_cooldowns?.length > 0 && (
+                <span className="ml-1 text-amber-400">
+                  ({autoStatus.active_cooldowns.length} active)
+                </span>
+              )}
+            </span>
             {lastTick && (
               <>
                 <span className="text-[#6b7280]">·</span>

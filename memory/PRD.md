@@ -352,6 +352,46 @@ other then the list from high priority."
 - Edge case: all 5 seats held by ramkella (hipri) → auto-tick safely
   skipped with `hipri_already_holds_seat`.
 
+## Iteration 20 — Stale-DB double-kill bug (manikant + adityaa) — 2026-06
+
+**User bug** (FlexLM log attached): after `ramkella` (hipri) got the
+freed seat by preempting `anushama` at 20:04:09, the loop fired AGAIN
+at 20:04:40 and 20:05:11 and killed `manikant` + `adityaa` without
+ramkella ever asking for them.
+
+**Root cause** — staleness window between auto-preempt (30s) and
+auto-sync (60s): when the loop kills holder X:
+1. lmremove succeeds → FlexLM frees the seat → ramkella's queued tool
+   immediately claims it (FlexLM side)
+2. LICMAN deletes X from db.checkouts but does NOT see ramkella's new
+   checkout until the next periodic sync (could be ~50s later)
+3. Next loop tick (30s later) → db.checkouts shows 4 stale non-hipri
+   holders, no hipri user → `hipri_already_holds_seat` guard misses →
+   loop kills ANOTHER non-hipri holder
+4. Cycle repeats every interval until enough seats are freed that some
+   really do go un-claimed
+
+**Fix** (3 layers of defence):
+1. **Per-(server, feature) cooldown** (default 180s, configurable via
+   `PREEMPT_COOLDOWN_SECONDS` env var). After a successful preempt,
+   the loop and on-demand REQUEST flow block further preempts on that
+   `(server, feature)` until the cooldown expires. New skip reason
+   `preempt_cooldown` with `cooldown_remaining_sec` field.
+2. **Live post-preempt refresh** (`_refresh_checkouts_after_preempt`):
+   fire-and-forget task that re-runs `_real_checkouts_via_ssh` for the
+   affected server immediately after a successful kill, replacing the
+   stale db.checkouts with live FlexLM state. The next tick now sees
+   ramkella holding, hits `hipri_already_holds_seat`, and stays put.
+3. **Status visibility**: `GET /api/feature-priorities/auto-status`
+   now includes `cooldown_sec` and `active_cooldowns[]` so admins can
+   see which (server, feature) is on hold and for how long. Status
+   banner on the Priority page shows `Cooldown: 180s (N active)`.
+
+**Verified**: re-seeded user's exact scenario (5/5 saturated, hipri=
+[ramkella], lopri=[], all holders non-hipri). Tick 1 preempted
+anushama (oldest). Tick 2 (immediately) returned actioned=0 with skip
+`preempt_cooldown · 179s remaining`. manikant + adityaa untouched. ✓
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

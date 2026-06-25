@@ -16,6 +16,7 @@ import re
 import smtplib
 import ssl
 import asyncio
+import time
 import secrets as _secrets
 import bcrypt
 import jwt as pyjwt
@@ -23,7 +24,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Tuple
 import uuid
 from datetime import datetime, timezone, timedelta, date
 
@@ -2090,6 +2091,9 @@ async def request_feature_seat(payload: FeatureRequestPayload,
         f"'{victim.get('user')}@{victim.get('host')}' (lopri) on {srv['name']}",
         payload.server_id, srv["name"], "warning",
     )
+    # Cooldown + live refresh so the next auto-tick doesn't pile on
+    _preempt_cooldown[(payload.server_id, feature)] = time.time() + _PREEMPT_COOLDOWN_SEC
+    asyncio.create_task(_refresh_checkouts_after_preempt(payload.server_id))
     return {
         "ok": True, "action": "preempted",
         "feature": feature, "server": srv["name"], "user": user,
@@ -2131,6 +2135,44 @@ async def request_feature_seat(payload: FeatureRequestPayload,
 
 _preempt_task: Optional[asyncio.Task] = None
 
+# Per-(server, feature) cooldown after a successful preempt. Prevents
+# back-to-back kills while we wait for (a) the hipri user's tool to claim
+# the freed seat and (b) the next sync to refresh db.checkouts. Without
+# this cooldown the loop sees stale DB data after a kill (FlexLM has moved
+# on but db.checkouts is still ~60s behind the auto-sync interval) and
+# wrongly preempts another holder on the next tick.
+_PREEMPT_COOLDOWN_SEC = int(os.environ.get("PREEMPT_COOLDOWN_SECONDS", "180"))
+_preempt_cooldown: Dict[Tuple[str, str], float] = {}
+
+
+async def _refresh_checkouts_after_preempt(server_id: str):
+    """Best-effort live refresh of `db.checkouts` for one server. Called
+    immediately after a successful preempt so the next loop iteration sees
+    the freed-then-reclaimed-by-hipri state instead of stale data.
+
+    Failures are silent — the periodic sync will catch up within 60s.
+    """
+    try:
+        doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+        if not doc or doc.get("adapter_mode") != "ssh":
+            return
+        parsed = await _real_checkouts_via_ssh(doc)
+        if not parsed or parsed.get("checkouts") is None:
+            return
+        if parsed.get("features"):
+            await db.servers.update_one(
+                {"id": server_id}, {"$set": {"features": parsed["features"]}}
+            )
+        await db.checkouts.delete_many({"server_id": server_id})
+        if parsed["checkouts"]:
+            await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+        logger.info(
+            f"post-preempt refresh: {doc['name']} now has "
+            f"{len(parsed['checkouts'])} checkouts in DB"
+        )
+    except Exception as e:
+        logger.warning(f"post-preempt refresh failed: {e}")
+
 
 async def _auto_preempt_tick_v2() -> dict:
     """One iteration. Returns a summary dict for logging / the admin endpoint."""
@@ -2157,6 +2199,15 @@ async def _auto_preempt_tick_v2() -> dict:
             continue
         implicit_lopri = not lopri_set
         if (server_id, feature) in freed:
+            continue
+        # Cooldown check — skip if we recently preempted on this feature
+        cd_until = _preempt_cooldown.get((server_id, feature))
+        if cd_until and time.time() < cd_until:
+            reasons.append({
+                "feature": feature, "server": "—",
+                "skip": "preempt_cooldown",
+                "cooldown_remaining_sec": int(cd_until - time.time()),
+            })
             continue
 
         srv = await db.servers.find_one({"id": server_id}, {"_id": 0})
@@ -2231,6 +2282,12 @@ async def _auto_preempt_tick_v2() -> dict:
             if kr.get("ok"):
                 actioned += 1
                 freed.add((server_id, feature))
+                # Set cooldown so the next tick doesn't double-kill while the
+                # hipri user's tool retries and FlexLM settles.
+                _preempt_cooldown[(server_id, feature)] = time.time() + _PREEMPT_COOLDOWN_SEC
+                # Fire-and-forget live refresh of this server's checkouts so
+                # subsequent ticks see the real FlexLM state, not stale DB.
+                asyncio.create_task(_refresh_checkouts_after_preempt(server_id))
                 results.append({
                     "feature": feature, "server": srv["name"],
                     "preempted_user": victim.get("user"),
@@ -2318,6 +2375,15 @@ async def feature_priority_auto_tick_now(_: dict = Depends(require_admin)):
 async def feature_priority_auto_status():
     cfg = await get_alert_settings()
     running = bool(_preempt_task and not _preempt_task.done())
+    now = time.time()
+    active_cooldowns = [
+        {
+            "server_id": sid, "feature": ft,
+            "remaining_sec": max(0, int(until - now)),
+        }
+        for (sid, ft), until in _preempt_cooldown.items()
+        if until > now
+    ]
     return {
         "running": running,
         "enabled_in_settings": bool(cfg.get("auto_preempt_enabled")),
@@ -2325,6 +2391,8 @@ async def feature_priority_auto_status():
             cfg.get("auto_preempt_interval_sec")
             or os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30")
         ),
+        "cooldown_sec": _PREEMPT_COOLDOWN_SEC,
+        "active_cooldowns": active_cooldowns,
     }
 
 
