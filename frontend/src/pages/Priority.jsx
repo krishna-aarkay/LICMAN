@@ -136,8 +136,10 @@ export default function Priority() {
     if (!form.feature?.trim()) return toast.error("Pick a feature");
     const hipri = parseUserList(form.hipri_users);
     const lopri = parseUserList(form.lopri_users);
-    if (!hipri.length && !lopri.length) {
-      return toast.error("Add at least one user to either group");
+    if (!hipri.length) {
+      return toast.error(
+        "HIGH-PRIORITY list cannot be empty. Add at least one user who may trigger preemption.",
+      );
     }
     setSaving(true);
     try {
@@ -610,14 +612,20 @@ export default function Priority() {
                   value={form.lopri_users}
                   onChange={(e) => setForm({ ...form, lopri_users: e.target.value })}
                   rows={3}
-                  placeholder="junior1, junior2, intern_b"
+                  placeholder="junior1, junior2, intern_b   (or leave EMPTY to mean: anyone not in HI-PRI)"
                   className="inp font-mono"
                   data-testid="edit-lopri"
                 />
                 <div className="text-[10px] text-[#6b7280] mt-1">
                   These users&apos; checkouts will be killed (via lmremove)
                   when a high-priority user requests this feature and seats
-                  are full.
+                  are full.{" "}
+                  <span className="text-amber-400">
+                    Leave EMPTY to implicitly treat every non-hipri holder as
+                    a preempt candidate
+                  </span>{" "}
+                  — useful when you want hipri users to always win without
+                  enumerating the whole rest of the org.
                 </div>
               </div>
               <div className="md:col-span-2 flex justify-end gap-2 pt-1">
@@ -691,6 +699,7 @@ function ConfigRow({ row, server, onEdit, onDelete, onQuickRequest }) {
           label="LO-PRI"
           color="red"
           users={row.lopri_users}
+          emptyLabel="// empty → implicit: all users not in HI-PRI"
         />
       </div>
       <div className="md:col-span-1 flex md:justify-end gap-1.5">
@@ -715,7 +724,7 @@ function ConfigRow({ row, server, onEdit, onDelete, onQuickRequest }) {
   );
 }
 
-function UserPills({ label, color, users, onClick }) {
+function UserPills({ label, color, users, onClick, emptyLabel }) {
   const palette = {
     emerald: { border: "border-emerald-700/40", text: "text-emerald-400", bg: "hover:bg-emerald-900/20" },
     red: { border: "border-red-700/40", text: "text-red-400", bg: "hover:bg-red-900/20" },
@@ -726,7 +735,9 @@ function UserPills({ label, color, users, onClick }) {
         {label} [{(users || []).length}]
       </div>
       {(users || []).length === 0 ? (
-        <div className="font-mono text-[10px] text-[#4b5563]">{"// empty"}</div>
+        <div className="font-mono text-[10px] text-[#6b7280] italic">
+          {emptyLabel || "// empty"}
+        </div>
       ) : (
         <div className="flex flex-wrap gap-1">
           {users.map((u) => (

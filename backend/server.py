@@ -1862,6 +1862,11 @@ async def upsert_feature_priority(payload: FeaturePriorityUpsert,
 
     hipri = _clean_userlist(payload.hipri_users)
     lopri = _clean_userlist(payload.lopri_users)
+    if not hipri:
+        raise HTTPException(
+            400, "HIGH-PRIORITY list cannot be empty — add at least one user "
+                 "who is allowed to trigger preemption.",
+        )
     # Reject overlap — a user cannot be in both groups for the same feature
     overlap = sorted({u.lower() for u in hipri} & {u.lower() for u in lopri})
     if overlap:
@@ -1985,33 +1990,55 @@ async def request_feature_seat(payload: FeatureRequestPayload,
             "message": f"{total - used} seat(s) free — '{user}' can check out {feature} now.",
         }
 
-    # Saturated — find a lopri victim
-    victims = [
-        h for h in holders
-        if h.get("user", "").lower() in lopri_lower
-    ]
+    # Saturated — find a lopri victim. If lopri list is empty, treat every
+    # non-hipri holder as an implicit candidate.
+    implicit_lopri = len(lopri_lower) == 0
+    if implicit_lopri:
+        victims = [
+            h for h in holders
+            if h.get("user", "").lower() not in hipri_lower
+        ]
+    else:
+        victims = [
+            h for h in holders
+            if h.get("user", "").lower() in lopri_lower
+        ]
     if not victims:
         reserved_note = (
             f" {reserved_count} seat(s) held by RESERVE-pool (other groups)."
             if reserved_count > 0 else ""
         )
+        if implicit_lopri:
+            human_reason = (
+                f"All {len(holders)} active holder(s) are in the HIGH-PRIORITY "
+                f"group (LO-PRI list is empty → implicit lopri = anyone NOT "
+                f"in hipri). Nothing safe to preempt."
+            )
+        else:
+            human_reason = (
+                f"None of the {len(holders)} active holder(s) are in the "
+                f"LOW-PRIORITY group. Cannot preempt — add active holders to "
+                f"the lopri list or leave it empty to treat all non-hipri "
+                f"users as implicit lopri."
+            )
         return {
             "ok": False, "action": "no_victim",
             "feature": feature, "server": srv["name"], "user": user,
             "seats_total": total, "seats_active": used_active,
             "seats_reserved": reserved_count, "seats_reported": used_reported,
+            "implicit_lopri": implicit_lopri,
             "current_holders": [
                 {"user": h.get("user"), "host": h.get("host"),
-                 "is_lopri": h.get("user", "").lower() in lopri_lower,
+                 "is_lopri": (
+                     (not implicit_lopri and h.get("user", "").lower() in lopri_lower)
+                     or (implicit_lopri and h.get("user", "").lower() not in hipri_lower)
+                 ),
                  "is_hipri": h.get("user", "").lower() in hipri_lower}
                 for h in holders
             ],
             "message": (
                 f"{used}/{total} seats held ({used_active} active + "
-                f"{reserved_count} reserved). None of the {len(holders)} active "
-                f"holder(s) are in the LOW-PRIORITY group.{reserved_note} "
-                f"Cannot preempt — add active holders to the lopri list or "
-                f"wait for a natural release."
+                f"{reserved_count} reserved). {human_reason}{reserved_note}"
             ),
         }
 
@@ -2123,9 +2150,12 @@ async def _auto_preempt_tick_v2() -> dict:
         server_id = cfg["server_id"]
         hipri_set = {u.lower() for u in cfg.get("hipri_users", [])}
         lopri_set = {u.lower() for u in cfg.get("lopri_users", [])}
-        if not hipri_set or not lopri_set:
-            reasons.append({"feature": feature, "skip": "empty_hipri_or_lopri"})
+        # Empty LO-PRI = implicit "everyone NOT in HI-PRI". So only skip when
+        # HI-PRI itself is empty (no preempt subject).
+        if not hipri_set:
+            reasons.append({"feature": feature, "skip": "empty_hipri"})
             continue
+        implicit_lopri = not lopri_set
         if (server_id, feature) in freed:
             continue
 
@@ -2169,12 +2199,23 @@ async def _auto_preempt_tick_v2() -> dict:
             })
             continue
 
-        # Find oldest lopri victim
-        lopri_holders = [h for h in holders if h.get("user", "").lower() in lopri_set]
+        # Find oldest lopri victim. If lopri list is empty, treat every
+        # non-hipri holder as an implicit candidate.
+        if implicit_lopri:
+            lopri_holders = [
+                h for h in holders
+                if h.get("user", "").lower() not in hipri_set
+            ]
+        else:
+            lopri_holders = [
+                h for h in holders
+                if h.get("user", "").lower() in lopri_set
+            ]
         if not lopri_holders:
             reasons.append({
                 "feature": feature, "server": srv["name"],
                 "skip": "no_lopri_victim",
+                "implicit_lopri": implicit_lopri,
                 "current_holders": [h.get("user") for h in holders],
             })
             continue

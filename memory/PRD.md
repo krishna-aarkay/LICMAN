@@ -305,6 +305,53 @@ one mismatched field and the daemon rejects with non-zero exit.
 checkouts NOT deleted (3 holders preserved). Switched back to mock
 adapter → success path returned `action=preempted, ok=true` as before.
 
+## Iteration 19 — Implicit LO-PRI (empty list = "everyone not in HI-PRI") — 2026-06
+
+**User request** (after the false-success fix worked, screenshot showed
+`SKIP_REASONS · EMPTY_HIPRI_OR_LOPRI` because user wanted to leave lopri
+empty): "make sure if low priority is empty then assume it all the users
+other then the list from high priority."
+
+**Implementation**:
+
+### Backend
+- `_auto_preempt_tick_v2` & `request_feature_seat`:
+  - Skip code changed from `not hipri_set or not lopri_set` → `not hipri_set`
+    (hipri is the only required list)
+  - Victim selection:
+    ```python
+    if implicit_lopri:                          # lopri_set is empty
+        candidates = [h for h in holders
+                      if h.user.lower() not in hipri_set]
+    else:
+        candidates = [h for h in holders
+                      if h.user.lower() in lopri_set]
+    ```
+  - The `hipri_already_holds_seat` guard still wins — if a hipri user
+    holds a seat, we never preempt anyone (no friendly fire).
+- `upsert_feature_priority` now requires `hipri_users` to be non-empty
+  (was: either list could be empty). `lopri_users=[]` is the documented
+  "implicit lopri" sentinel.
+- New diagnostic fields in `no_victim` / `no_lopri_victim` reasons:
+  `implicit_lopri: bool` so the UI can colour the message correctly.
+
+### Frontend
+- `UserPills` now accepts an `emptyLabel` prop. The LO-PRI render shows
+  `"// empty → implicit: all users not in HI-PRI"` instead of the bare
+  `// empty`, so admins know the empty list is meaningful.
+- Editor textarea placeholder + help text updated to explain the implicit
+  behaviour. Yellow "Leave EMPTY to implicitly treat every non-hipri
+  holder as a preempt candidate" callout.
+- Save validation tightened to mirror backend: hipri required, lopri optional.
+
+### Verified
+- Seeded Conformal_Asic 5/5, hipri=[ramkella], lopri=EMPTY, all holders
+  are NOT ramkella → auto-tick correctly preempted oldest non-hipri
+  holder (`divakar_ac`); subsequent REQUEST by ramkella preempted next
+  (`reshma_mc`); only 3 holders remained.
+- Edge case: all 5 seats held by ramkella (hipri) → auto-tick safely
+  skipped with `hipri_already_holds_seat`.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.
