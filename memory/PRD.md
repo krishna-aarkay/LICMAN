@@ -254,6 +254,57 @@ try to kill a RESERVE pool seat because there's no specific user to fire).
 After her preempt, /request from a hipri user correctly returns `no_victim`
 with full breakdown `seats_active=23, seats_reserved=51, seats_reported=75`.
 
+## Iteration 18 — FALSE-SUCCESS bug fix for lmremove — 2026-06
+
+**User bug (real prod, screenshots attached)**: Priority page said
+"PREEMPTED · CADENCE-105 → Conformal_Asic · preempted anushama@…" but the
+Control Room live checkouts still showed anushama holding the seat 3
+minutes later. ramkella's terminal was looping "Waiting for
+Conformal_Asic…". Audit log alternated `WARN AUTO_PREEMPT_V2 · Auto-
+released anushama@…` immediately followed by `ERR CHECKOUT_KILL · kill
+Conformal_Asic for anushama@… (exit != 0)`.
+
+**Root cause #1 — false-success reporting**: `kill_checkout()` returned
+`{"ok": False, ...}` when `lmremove` exited non-zero, **but never raised**.
+Both `_auto_preempt_tick_v2` and `request_feature_seat` blindly logged
+"PREEMPTED" / "AUTO_PREEMPT_V2" audit lines + appended a success result
+**before** inspecting `kr["ok"]`. So the UI claimed victory on every
+failed `lmremove`.
+
+**Root cause #2 — hostname mismatch killing lmremove**: the parser
+captured FQDNs (`mctl-scs26.moschiptech.com`) but FlexLM's internal
+checkout table records the short form (`mctl-scs26`) or vice-versa.
+`lmremove` requires exact equality on `feature user host [display]` —
+one mismatched field and the daemon rejects with non-zero exit.
+
+**Fixes**:
+1. **`kill_checkout` now tries up to 4 variants** per call: each
+   permutation of `host_variants = [as-given, short]` × `display_variants
+   = ["", as-given]`. Stops at the first exit==0. Returns full
+   `attempts[]` trace.
+2. **`request_feature_seat`** now checks `kr["ok"]`. On failure:
+   - Returns new action `preempt_failed` (HTTP 200, ok=false) with the
+     real `exec` output + `attempts[]` array + `message` containing the
+     exact lmremove error
+   - Logs `PRIORITY_PREEMPT_FAILED` audit (not the success line)
+   - Does NOT mark the (server, feature) as actioned
+3. **`_auto_preempt_tick_v2`** same change — on failure it now appends an
+   `outcome: "preempt_failed"` row (red card in UI, NOT counted toward
+   `actioned`) and logs `AUTO_PREEMPT_V2_FAILED` with severity=error. The
+   `freed` guard is NOT updated, so the next tick will retry naturally.
+4. **Frontend ResultCard** now renders a full failure panel:
+   - lmremove attempts table (host tried | display | exit | output)
+   - "What to try next" checklist: run lmremove manually from license
+     server, check INCLUDE_BORROW, kill the user's process on their host
+     (sticky-client case), re-sync the server
+5. **Frontend last-tick diag** now styles `preempt_failed` rows in red
+   with the lmremove error inline.
+
+**Verified**: forced an SSH failure mode → POST /request returned
+`action=preempt_failed, ok=false, attempts=4` with full trace; DB
+checkouts NOT deleted (3 holders preserved). Switched back to mock
+adapter → success path returned `action=preempted, ok=true` as before.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

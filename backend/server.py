@@ -1701,22 +1701,72 @@ async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dic
     # All identifiers are pre-validated above; quote defensively anyway.
     target = f"{doc['port']}@{doc['host']}"
     display = payload.display.strip() if payload.display else ""
-    cmd = (
-        f"{_shlex.quote(lmutil)} lmremove "
-        f"-c {_shlex.quote(target)} "
-        f"{_shlex.quote(payload.feature)} "
-        f"{_shlex.quote(payload.user)} "
-        f"{_shlex.quote(payload.host)}"
-    )
-    if display:
-        cmd += f" {_shlex.quote(display)}"
-    exec_log = await ssh_execute(doc, cmd)
-    ok = exec_log.get("exit") == 0 or exec_log.get("mode") == "mock"
+
+    # Hostname-variant fallback. FlexLM's internal checkout table sometimes
+    # records the short hostname while the parser captured the FQDN (or
+    # vice-versa). `lmremove` requires exact equality, so we try every
+    # plausible variant: as-given, short (first dot), and FQDN if we have a
+    # hint to add one. Plus a display-less retry — some daemons reject the
+    # display arg when their stored display is empty.
+    def _host_variants(h: str) -> List[str]:
+        h = (h or "").strip()
+        if not h:
+            return [""]
+        variants = [h]
+        if "." in h:
+            short = h.split(".", 1)[0]
+            if short and short not in variants:
+                variants.append(short)
+        return variants
+
+    def _disp_variants(d: str) -> List[str]:
+        # Always try without display first (most permissive on real FlexLM),
+        # then with the captured display.
+        out = [""]
+        if d and d not in out:
+            out.append(d)
+        return out
+
+    def _build_cmd(user_host: str, user_disp: str) -> str:
+        c = (
+            f"{_shlex.quote(lmutil)} lmremove "
+            f"-c {_shlex.quote(target)} "
+            f"{_shlex.quote(payload.feature)} "
+            f"{_shlex.quote(payload.user)} "
+            f"{_shlex.quote(user_host)}"
+        )
+        if user_disp:
+            c += f" {_shlex.quote(user_disp)}"
+        return c
+
+    attempts: List[dict] = []
+    final_exec: dict = {"exit": -1, "output": "no attempts made", "mode": "ssh", "command": ""}
+    ok = False
+    for h_try in _host_variants(payload.host):
+        for d_try in _disp_variants(display):
+            cmd = _build_cmd(h_try, d_try)
+            ex = await ssh_execute(doc, cmd)
+            ex["host_tried"] = h_try
+            ex["display_tried"] = d_try
+            attempts.append({
+                "host": h_try, "display": d_try,
+                "exit": ex.get("exit"),
+                "output": (ex.get("output") or "")[:200],
+            })
+            final_exec = ex
+            if ex.get("exit") == 0 or ex.get("mode") == "mock":
+                ok = True
+                break
+        if ok:
+            break
+
     severity = "success" if ok else "error"
+    detail_tail = (final_exec.get("output") or "").strip().splitlines()[-1] if final_exec.get("output") else ""
     await log_audit(
         "CHECKOUT_KILL",
         f"kill {payload.feature} for {payload.user}@{payload.host} on {doc['name']} "
-        f"[{exec_log.get('mode')}] · {(exec_log.get('output') or '')[:200]}",
+        f"[{final_exec.get('mode')}] tries={len(attempts)} exit={final_exec.get('exit')} "
+        f"· {detail_tail[:180]}",
         server_id, doc["name"], severity,
     )
     if ok:
@@ -1726,7 +1776,23 @@ async def kill_checkout(server_id: str, payload: KillCheckoutPayload, admin: dic
             "user": payload.user,
             "host": payload.host,
         })
-    return {"ok": ok, "message": f"lmremove issued for {payload.feature}", "exec": exec_log}
+        return {
+            "ok": True,
+            "message": f"lmremove succeeded for {payload.feature}",
+            "exec": final_exec,
+            "attempts": attempts,
+        }
+    # FAILURE — surface the real reason so callers can show it, don't claim victory
+    return {
+        "ok": False,
+        "message": (
+            f"lmremove FAILED after {len(attempts)} attempt(s) for "
+            f"{payload.user}@{payload.host}. Last output: "
+            f"{detail_tail or 'no output'}"
+        ),
+        "exec": final_exec,
+        "attempts": attempts,
+    }
 
 
 # ========================================================================
@@ -1962,6 +2028,35 @@ async def request_feature_seat(payload: FeatureRequestPayload,
     except HTTPException as e:
         raise HTTPException(500, f"Preempt failed: {e.detail}")
 
+    # CRITICAL — lmremove may return non-zero (host mismatch, sticky client,
+    # not-admin). kill_checkout returns ok=False in that case and we must
+    # NOT claim success.
+    if not kr.get("ok"):
+        await log_audit(
+            "PRIORITY_PREEMPT_FAILED",
+            f"'{user}' (hipri) requested '{feature}' on {srv['name']} → tried "
+            f"to preempt '{victim.get('user')}@{victim.get('host')}' but "
+            f"lmremove failed: {kr.get('message')}",
+            payload.server_id, srv["name"], "error",
+        )
+        return {
+            "ok": False, "action": "preempt_failed",
+            "feature": feature, "server": srv["name"], "user": user,
+            "tried_preempt_user": victim.get("user"),
+            "tried_preempt_host": victim.get("host"),
+            "exec": kr.get("exec"),
+            "attempts": kr.get("attempts"),
+            "message": (
+                f"Tried to preempt '{victim.get('user')}@{victim.get('host')}' but "
+                f"lmremove returned non-zero. Reason: {kr.get('message')}. "
+                f"Common causes: (1) LICMAN SSH user is not a FlexLM admin → "
+                f"add it to the vendor daemon's INCLUDE_BORROW or run lmremove "
+                f"from the license server. (2) Hostname stored differs from "
+                f"FlexLM's internal record. (3) Client tool immediately "
+                f"reconnected — kill the process on the user's host instead."
+            ),
+        }
+
     await log_audit(
         "PRIORITY_PREEMPT",
         f"'{user}' (hipri) requested '{feature}' → preempted "
@@ -1974,6 +2069,7 @@ async def request_feature_seat(payload: FeatureRequestPayload,
         "preempted_user": victim.get("user"),
         "preempted_host": victim.get("host"),
         "exec": kr.get("exec"),
+        "attempts": kr.get("attempts"),
         "message": (
             f"Preempted '{victim.get('user')}@{victim.get('host')}'. "
             f"'{user}' can now check out '{feature}'."
@@ -2091,23 +2187,45 @@ async def _auto_preempt_tick_v2() -> dict:
         )
         try:
             kr = await kill_checkout(server_id, kp, fake_admin)
-            actioned += 1
-            freed.add((server_id, feature))
-            results.append({
-                "feature": feature, "server": srv["name"],
-                "preempted_user": victim.get("user"),
-                "preempted_host": victim.get("host"),
-                "outcome": "preempted",
-                "hipri_pool": sorted(hipri_set),
-                "exec": kr.get("exec"),
-            })
-            await log_audit(
-                "AUTO_PREEMPT_V2",
-                f"Auto-released '{victim.get('user')}@{victim.get('host')}' "
-                f"(lopri) on '{feature}' to keep a seat available for hipri "
-                f"pool {sorted(hipri_set)} (server={srv['name']})",
-                server_id, srv["name"], "warning",
-            )
+            if kr.get("ok"):
+                actioned += 1
+                freed.add((server_id, feature))
+                results.append({
+                    "feature": feature, "server": srv["name"],
+                    "preempted_user": victim.get("user"),
+                    "preempted_host": victim.get("host"),
+                    "outcome": "preempted",
+                    "hipri_pool": sorted(hipri_set),
+                    "exec": kr.get("exec"),
+                    "attempts": kr.get("attempts"),
+                })
+                await log_audit(
+                    "AUTO_PREEMPT_V2",
+                    f"Auto-released '{victim.get('user')}@{victim.get('host')}' "
+                    f"(lopri) on '{feature}' to keep a seat available for hipri "
+                    f"pool {sorted(hipri_set)} (server={srv['name']})",
+                    server_id, srv["name"], "warning",
+                )
+            else:
+                # lmremove FAILED — do NOT claim victory, do NOT mark (server,
+                # feature) as freed so the next tick can retry. Surface the
+                # real reason for the admin.
+                results.append({
+                    "feature": feature, "server": srv["name"],
+                    "tried_preempt_user": victim.get("user"),
+                    "tried_preempt_host": victim.get("host"),
+                    "outcome": "preempt_failed",
+                    "hipri_pool": sorted(hipri_set),
+                    "exec": kr.get("exec"),
+                    "attempts": kr.get("attempts"),
+                    "error": kr.get("message"),
+                })
+                await log_audit(
+                    "AUTO_PREEMPT_V2_FAILED",
+                    f"Tried to auto-release '{victim.get('user')}@{victim.get('host')}' "
+                    f"on '{feature}' but lmremove failed: {kr.get('message')}",
+                    server_id, srv["name"], "error",
+                )
         except HTTPException as e:
             results.append({"feature": feature, "server": srv["name"],
                             "outcome": f"error: {e.detail}"})

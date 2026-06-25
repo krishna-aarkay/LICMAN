@@ -314,20 +314,38 @@ export default function Priority() {
                 <div className="text-[#6b7280] italic">// no actions this tick</div>
               )}
               <div className="max-h-44 overflow-y-auto space-y-1">
-                {(lastTick.results || []).map((r, i) => (
-                  <div key={i} className="border border-[#1a1a1a] px-2 py-1.5 bg-[#0a0a0a]">
-                    <div className="text-emerald-400 text-[10px] uppercase">{r.outcome}</div>
-                    <div className="text-white">
-                      {r.server} → {r.feature}
+                {(lastTick.results || []).map((r, i) => {
+                  const failed = r.outcome === "preempt_failed";
+                  return (
+                    <div
+                      key={i}
+                      className={`border px-2 py-1.5 ${
+                        failed
+                          ? "border-red-700/40 bg-red-900/10"
+                          : "border-[#1a1a1a] bg-[#0a0a0a]"
+                      }`}
+                    >
+                      <div className={`text-[10px] uppercase ${failed ? "text-red-400" : "text-emerald-400"}`}>
+                        {r.outcome}
+                      </div>
+                      <div className="text-white">
+                        {r.server} → {r.feature}
+                      </div>
+                      <div className="text-[#9ca3af]">
+                        {failed ? "tried to kill" : "preempted"}:{" "}
+                        <span className="text-red-400">
+                          {(r.preempted_user || r.tried_preempt_user)}@
+                          {(r.preempted_host || r.tried_preempt_host)}
+                        </span>
+                      </div>
+                      {failed && r.error && (
+                        <div className="text-[9px] text-amber-300 mt-0.5 break-all">
+                          {r.error}
+                        </div>
+                      )}
                     </div>
-                    <div className="text-[#9ca3af]">
-                      preempted:{" "}
-                      <span className="text-red-400">
-                        {r.preempted_user}@{r.preempted_host}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
             <div>
@@ -757,6 +775,52 @@ function ResultCard({ r }) {
           {"\n"}
           {r.exec.output}
         </pre>
+      )}
+      {r.action === "preempt_failed" && (
+        <div className="mt-2 space-y-2">
+          {r.attempts?.length > 0 && (
+            <div className="text-[10px]">
+              <div className="text-amber-400 uppercase tracking-[0.2em] mb-1">
+                lmremove attempts ({r.attempts.length})
+              </div>
+              <div className="border border-[#1a1a1a] bg-[#0a0a0a]">
+                <table className="w-full">
+                  <thead>
+                    <tr className="text-[#6b7280] text-[9px] uppercase">
+                      <th className="text-left px-2 py-1">host tried</th>
+                      <th className="text-left px-2 py-1">display</th>
+                      <th className="text-right px-2 py-1">exit</th>
+                      <th className="text-left px-2 py-1">output</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {r.attempts.map((a, i) => (
+                      <tr key={i} className="border-t border-[#1a1a1a]">
+                        <td className="px-2 py-1 text-white">{a.host || "—"}</td>
+                        <td className="px-2 py-1 text-[#9ca3af]">{a.display || "(none)"}</td>
+                        <td className="px-2 py-1 text-right">
+                          <span className={a.exit === 0 ? "text-emerald-400" : "text-red-400"}>
+                            {a.exit}
+                          </span>
+                        </td>
+                        <td className="px-2 py-1 text-[#9ca3af] break-all">{a.output}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          <div className="text-[10px] text-amber-400 border-l-2 border-amber-700/60 pl-2">
+            <div className="uppercase tracking-[0.2em] mb-1">What to try next</div>
+            <ul className="list-disc list-inside text-[#d1d5db] space-y-0.5">
+              <li>Run <code className="text-emerald-400">lmutil lmremove</code> manually from the license server itself — workstation lmutil is often blocked by FlexLM ACLs.</li>
+              <li>Check the vendor daemon options file for <code className="text-emerald-400">INCLUDE_BORROW</code> / admin restrictions.</li>
+              <li>If the user&apos;s tool client immediately reconnects (sticky), kill the process on their host (<code className="text-emerald-400">kill -9 &lt;pid&gt;</code>).</li>
+              <li>Re-sync the server (Dashboard → SYNC ALL) — the stored hostname may be stale; FlexLM&apos;s internal host string may differ from what the parser captured.</li>
+            </ul>
+          </div>
+        </div>
       )}
       {r.action === "no_victim" && r.current_holders?.length > 0 && (
         <div className="mt-2 text-[10px] text-[#9ca3af]">
