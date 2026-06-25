@@ -392,6 +392,40 @@ auto-sync (60s): when the loop kills holder X:
 anushama (oldest). Tick 2 (immediately) returned actioned=0 with skip
 `preempt_cooldown · 179s remaining`. manikant + adityaa untouched. ✓
 
+## Iteration 21 — Stale-DB FALSE PREEMPT (manikant) + ghost-holder cleanup — 2026-06
+
+**User bug** (screenshots show `PREEMPT_FAILED · lmremove: feature/user/host/display not found` for manikant@mctl-scsr23, while the FlexLM log shows ramkella was already holding the seat from 20:47:17):
+
+The iteration-20 cooldown only triggered AFTER a successful preempt. But this scenario has no successful preempt — the loop tried to kill manikant based on stale `db.checkouts` (auto-sync runs every 60s, auto-preempt every 30s), got "not found" because manikant had probably already released and FlexLM had moved on.
+
+**Root cause**: every decision was made on data up to ~60s stale.
+
+**Fix** (three changes, on top of iteration 20 cooldown):
+
+1. **Pre-flight live refresh** for every (unique) server BEFORE the loop scans its configs:
+   ```python
+   unique_servers = sorted({cfg["server_id"] for cfg in configs})
+   await asyncio.gather(
+       *[_refresh_server_state(sid) for sid in unique_servers],
+       return_exceptions=True,
+   )
+   ```
+   Now the `hipri_already_holds_seat` guard sees ramkella's seat the moment FlexLM does. Auto-loop is never more than ~1 tick stale.
+
+2. **Same pre-flight refresh in the on-demand REQUEST flow** (`request_feature_seat`) — admins clicking REQUEST never get a false-preempt on stale data either.
+
+3. **Ghost-holder cleanup on `lmremove ... not found`**: when lmremove fails because FlexLM doesn't know the (feature, user, host, display) tuple anymore (= the holder already released), the loop now:
+   - Deletes the stale row from `db.checkouts` so it doesn't try the same ghost forever
+   - Fires a `_refresh_server_state(server_id)` to repopulate with truth
+   - Applies a 60s cooldown so the next tick doesn't immediately try ANOTHER ghost on the same feature
+
+**Helper renamed**: `_refresh_checkouts_after_preempt` → `_refresh_server_state` (it's now called BOTH before decisions AND after preempts).
+
+**Verified**:
+- Seeded 5/5 saturated, ramkella IS one of the 5 holders → auto-tick skipped with `hipri_already_holds_seat`, manual REQUEST returned `already_holding`. manikant/adityaa SAFE.
+- Seeded 5/5 saturated, ramkella NOT in DB → auto-tick preempted oldest (mock mode); second tick immediately → cooldown reason `cadence-prod-01 → Conformal_Asic · 175s remaining`.
+- Refresh helper is best-effort; failures are silent (periodic sync catches up).
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

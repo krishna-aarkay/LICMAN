@@ -1956,6 +1956,13 @@ async def request_feature_seat(payload: FeatureRequestPayload,
     if not feat:
         raise HTTPException(404, f"Feature '{feature}' not on this server")
 
+    # Pre-flight live refresh — never act on stale db.checkouts. Critical to
+    # avoid the "ramkella already holds, but DB doesn't know yet → preempt
+    # someone else" false-positive.
+    await _refresh_server_state(payload.server_id)
+    srv = await db.servers.find_one({"id": payload.server_id}, {"_id": 0}) or srv
+    feat = next((f for f in (srv.get("features") or []) if f["name"] == feature), None) or feat
+
     holders = await db.checkouts.find(
         {"server_id": payload.server_id, "feature": feature}, {"_id": 0}
     ).to_list(500)
@@ -2093,7 +2100,7 @@ async def request_feature_seat(payload: FeatureRequestPayload,
     )
     # Cooldown + live refresh so the next auto-tick doesn't pile on
     _preempt_cooldown[(payload.server_id, feature)] = time.time() + _PREEMPT_COOLDOWN_SEC
-    asyncio.create_task(_refresh_checkouts_after_preempt(payload.server_id))
+    asyncio.create_task(_refresh_server_state(payload.server_id))
     return {
         "ok": True, "action": "preempted",
         "feature": feature, "server": srv["name"], "user": user,
@@ -2145,10 +2152,11 @@ _PREEMPT_COOLDOWN_SEC = int(os.environ.get("PREEMPT_COOLDOWN_SECONDS", "180"))
 _preempt_cooldown: Dict[Tuple[str, str], float] = {}
 
 
-async def _refresh_checkouts_after_preempt(server_id: str):
-    """Best-effort live refresh of `db.checkouts` for one server. Called
-    immediately after a successful preempt so the next loop iteration sees
-    the freed-then-reclaimed-by-hipri state instead of stale data.
+async def _refresh_server_state(server_id: str):
+    """Best-effort live refresh of `db.checkouts` (and feature counts) for
+    one server. Called BEFORE every auto-preempt decision so we never act on
+    stale data, and AFTER every successful preempt so subsequent ticks see
+    the hipri user's reclaimed seat immediately.
 
     Failures are silent — the periodic sync will catch up within 60s.
     """
@@ -2187,6 +2195,17 @@ async def _auto_preempt_tick_v2() -> dict:
     # Don't preempt the same (server, feature) twice in one tick
     freed: set = set()
 
+    # ─── Pre-flight: refresh every server we care about FIRST. ───
+    # The `hipri_already_holds_seat` guard depends on db.checkouts having the
+    # latest holders. The periodic auto-sync runs every 60s but this loop
+    # runs every 30s, so without a pre-flight refresh the second/third tick
+    # after a preempt can act on data older than FlexLM's reality.
+    unique_servers = sorted({cfg["server_id"] for cfg in configs})
+    await asyncio.gather(
+        *[_refresh_server_state(sid) for sid in unique_servers],
+        return_exceptions=True,
+    )
+
     for cfg in configs:
         feature = cfg["feature"]
         server_id = cfg["server_id"]
@@ -2200,11 +2219,16 @@ async def _auto_preempt_tick_v2() -> dict:
         implicit_lopri = not lopri_set
         if (server_id, feature) in freed:
             continue
-        # Cooldown check — skip if we recently preempted on this feature
+        # Cooldown check — skip if we recently preempted on this feature.
+        # We do this BEFORE the per-server refresh (no point refreshing if
+        # we're going to skip).
         cd_until = _preempt_cooldown.get((server_id, feature))
         if cd_until and time.time() < cd_until:
+            # Try to surface server name for readability
+            _srv_doc = await db.servers.find_one({"id": server_id}, {"_id": 0, "name": 1})
             reasons.append({
-                "feature": feature, "server": "—",
+                "feature": feature,
+                "server": (_srv_doc or {}).get("name", "—"),
                 "skip": "preempt_cooldown",
                 "cooldown_remaining_sec": int(cd_until - time.time()),
             })
@@ -2287,7 +2311,7 @@ async def _auto_preempt_tick_v2() -> dict:
                 _preempt_cooldown[(server_id, feature)] = time.time() + _PREEMPT_COOLDOWN_SEC
                 # Fire-and-forget live refresh of this server's checkouts so
                 # subsequent ticks see the real FlexLM state, not stale DB.
-                asyncio.create_task(_refresh_checkouts_after_preempt(server_id))
+                asyncio.create_task(_refresh_server_state(server_id))
                 results.append({
                     "feature": feature, "server": srv["name"],
                     "preempted_user": victim.get("user"),
@@ -2307,7 +2331,9 @@ async def _auto_preempt_tick_v2() -> dict:
             else:
                 # lmremove FAILED — do NOT claim victory, do NOT mark (server,
                 # feature) as freed so the next tick can retry. Surface the
-                # real reason for the admin.
+                # real reason for the admin. Also force-refresh state: if the
+                # error was "not found", db.checkouts is wrong and the next
+                # tick should NOT retry on the same stale data.
                 results.append({
                     "feature": feature, "server": srv["name"],
                     "tried_preempt_user": victim.get("user"),
@@ -2318,6 +2344,18 @@ async def _auto_preempt_tick_v2() -> dict:
                     "attempts": kr.get("attempts"),
                     "error": kr.get("message"),
                 })
+                # Drop the stale row so we don't keep retrying the same ghost
+                # holder forever. The pre-flight refresh on the next tick
+                # will repopulate whatever is actually held.
+                await db.checkouts.delete_many({
+                    "server_id": server_id, "feature": feature,
+                    "user": victim.get("user", ""),
+                    "host": victim.get("host", ""),
+                })
+                asyncio.create_task(_refresh_server_state(server_id))
+                # Apply a short cooldown so we don't immediately try ANOTHER
+                # ghost holder on the same feature in the next tick.
+                _preempt_cooldown[(server_id, feature)] = time.time() + 60
                 await log_audit(
                     "AUTO_PREEMPT_V2_FAILED",
                     f"Tried to auto-release '{victim.get('user')}@{victim.get('host')}' "
