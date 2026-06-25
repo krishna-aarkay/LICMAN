@@ -347,6 +347,11 @@ export default function Priority() {
                     {r.used != null && (
                       <div className="text-[#9ca3af]">
                         used={r.used}/total={r.total}
+                        {(r.reserved > 0 || r.used_active != null) && (
+                          <span className="text-[#6b7280]">
+                            {" "}(active={r.used_active}, reported={r.used_reported}, reserved={r.reserved})
+                          </span>
+                        )}
                       </div>
                     )}
                     {r.current_holders && (
@@ -624,8 +629,11 @@ export default function Priority() {
 
 // ────────────────────────────────────────────────────────────────────────
 function ConfigRow({ row, server, onEdit, onDelete, onQuickRequest }) {
-  const total =
-    server?.features?.find((f) => f.name === row.feature)?.total ?? 0;
+  const feat = server?.features?.find((f) => f.name === row.feature);
+  const total = feat?.total ?? 0;
+  const inUse = feat?.in_use_reported ?? 0;
+  const free = Math.max(0, total - inUse);
+  const isSat = total > 0 && inUse >= total;
   return (
     <div
       className="px-4 py-3 hover:bg-[#0e0e0e] grid grid-cols-1 md:grid-cols-12 gap-3 items-start"
@@ -636,8 +644,20 @@ function ConfigRow({ row, server, onEdit, onDelete, onQuickRequest }) {
           {server?.name || "— unknown server —"}
         </div>
         <div className="font-mono text-white text-sm mt-0.5">{row.feature}</div>
-        <div className="font-mono text-[10px] text-[#9ca3af] mt-0.5">
-          total seats: <span className="text-emerald-400 tabular-nums">{total}</span>
+        <div className="font-mono text-[10px] text-[#9ca3af] mt-1 space-y-0.5">
+          <div>
+            seats:{" "}
+            <span className={`tabular-nums ${isSat ? "text-red-400" : "text-emerald-400"}`}>
+              {inUse}/{total}
+            </span>
+            {isSat && (
+              <span className="ml-1.5 text-red-400 text-[9px] uppercase">SAT</span>
+            )}
+          </div>
+          <div>
+            free: <span className="text-white tabular-nums">{free}</span>
+            <span className="text-[#6b7280]"> · reported by lmstat (incl. RESERVE pools)</span>
+          </div>
         </div>
       </div>
       <div className="md:col-span-4">

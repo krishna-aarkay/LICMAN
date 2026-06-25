@@ -1887,7 +1887,20 @@ async def request_feature_seat(payload: FeatureRequestPayload,
     holders = await db.checkouts.find(
         {"server_id": payload.server_id, "feature": feature}, {"_id": 0}
     ).to_list(500)
-    used = sum(int(h.get("count") or 1) for h in holders)
+    # Active checkouts the parser captured (granular, with user/host)
+    used_active = sum(int(h.get("count") or 1) for h in holders)
+    # Authoritative count from lmstat header — includes group RESERVE pools and
+    # any holder lines the parser failed to attribute. This is what FlexLM
+    # actually shows as "in use".
+    used_reported = int(feat.get("in_use_reported") or 0)
+    # Reservation pool from db.reservations (RESERVE n feature GROUP …).
+    reservations_pool = await db.reservations.find(
+        {"server_id": payload.server_id, "feature": feature}, {"_id": 0}
+    ).to_list(500)
+    reserved_count = sum(int(r.get("count") or 1) for r in reservations_pool)
+    # Effective "used" = whichever is larger. This is what determines if a
+    # hipri user can grab a seat right now.
+    used = max(used_active, used_reported, used_active + reserved_count)
     total = int(feat.get("total") or 0)
 
     if any(h.get("user", "").lower() == user.lower() for h in holders):
@@ -1902,6 +1915,7 @@ async def request_feature_seat(payload: FeatureRequestPayload,
             "ok": True, "action": "available",
             "feature": feature, "server": srv["name"], "user": user,
             "seats_free": total - used, "seats_total": total,
+            "seats_active": used_active, "seats_reserved": reserved_count,
             "message": f"{total - used} seat(s) free — '{user}' can check out {feature} now.",
         }
 
@@ -1911,9 +1925,15 @@ async def request_feature_seat(payload: FeatureRequestPayload,
         if h.get("user", "").lower() in lopri_lower
     ]
     if not victims:
+        reserved_note = (
+            f" {reserved_count} seat(s) held by RESERVE-pool (other groups)."
+            if reserved_count > 0 else ""
+        )
         return {
             "ok": False, "action": "no_victim",
             "feature": feature, "server": srv["name"], "user": user,
+            "seats_total": total, "seats_active": used_active,
+            "seats_reserved": reserved_count, "seats_reported": used_reported,
             "current_holders": [
                 {"user": h.get("user"), "host": h.get("host"),
                  "is_lopri": h.get("user", "").lower() in lopri_lower,
@@ -1921,8 +1941,11 @@ async def request_feature_seat(payload: FeatureRequestPayload,
                 for h in holders
             ],
             "message": (
-                f"{used}/{total} seats held — none of the holders are in the LOW-PRIORITY group. "
-                f"Cannot preempt. Add holders to the lopri list or wait for a natural release."
+                f"{used}/{total} seats held ({used_active} active + "
+                f"{reserved_count} reserved). None of the {len(holders)} active "
+                f"holder(s) are in the LOW-PRIORITY group.{reserved_note} "
+                f"Cannot preempt — add active holders to the lopri list or "
+                f"wait for a natural release."
             ),
         }
 
@@ -2023,12 +2046,21 @@ async def _auto_preempt_tick_v2() -> dict:
         holders = await db.checkouts.find(
             {"server_id": server_id, "feature": feature}, {"_id": 0}
         ).to_list(500)
-        used = sum(int(h.get("count") or 1) for h in holders)
+        used_active = sum(int(h.get("count") or 1) for h in holders)
+        used_reported = int(feat.get("in_use_reported") or 0)
+        reservations_pool = await db.reservations.find(
+            {"server_id": server_id, "feature": feature}, {"_id": 0}
+        ).to_list(500)
+        reserved_count = sum(int(r.get("count") or 1) for r in reservations_pool)
+        used = max(used_active, used_reported, used_active + reserved_count)
         total = int(feat.get("total") or 0)
         if total <= 0 or used < total:
             reasons.append({
                 "feature": feature, "server": srv["name"],
-                "skip": "not_saturated", "used": used, "total": total,
+                "skip": "not_saturated",
+                "used": used, "total": total,
+                "used_active": used_active, "used_reported": used_reported,
+                "reserved": reserved_count,
             })
             continue
 

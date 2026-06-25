@@ -219,6 +219,41 @@ Completely rebuilt from scratch. Three sections:
 
 **Testing**: 12/12 backend + 7/7 frontend in `/app/test_reports/iteration_15.json`. Validated `.inp` color values directly via `page.evaluate(window.getComputedStyle)` and the background loop preempted a freshly-saturated all-lopri config in ~10-30s with interval=10s.
 
+## Iteration 17 — Reservation-aware saturation — 2026-06
+
+**User bug** (real Conformal_Asic case, screenshot attached):
+- Feature: `Conformal_Asic`, total=75, lmstat reports 75 IN USE (100%)
+- Detail modal: 24 ACTIVE checkouts, 0 RESERVED, 75 REPORTED
+- Reality: 51 seats held by FlexLM RESERVE pool for other team(s)
+- Auto-preempt panel said "NOT_SATURATED used=24/total=75" → never fired
+
+**Root cause**: both `request_feature_seat()` and `_auto_preempt_tick_v2()`
+computed `used` as `sum(count) from db.checkouts` only — they ignored
+`feat.in_use_reported` (the authoritative number from `Total of N licenses
+in use` in lmstat header) and the `db.reservations` pool.
+
+**Fix** (both `request_feature_seat` and `_auto_preempt_tick_v2`):
+```python
+used_active   = sum(count for h in db.checkouts)
+used_reported = feat.in_use_reported              # from lmstat header
+reserved      = sum(count for r in db.reservations)
+used          = max(used_active, used_reported, used_active + reserved)
+```
+This treats the feature as saturated whenever **any** of the three signals
+says so. Preempt still targets the oldest visible LOPRI holder (we never
+try to kill a RESERVE pool seat because there's no specific user to fire).
+
+**UI surface**:
+- Each config row now shows `seats: in_use/total [SAT]` + `free: N · reported
+  by lmstat (incl. RESERVE pools)` so admins can see the true utilisation.
+- SKIP REASONS panel adds `(active=…, reported=…, reserved=…)` breakdown
+  on every `NOT_SATURATED` line so it's obvious which signal triggered.
+
+**Verified**: seeded Conformal_Asic with 23 unknown holders + anushama (lopri)
++ 51 RESERVE pool. Auto-tick now detects saturation and preempts anushama.
+After her preempt, /request from a hipri user correctly returns `no_victim`
+with full breakdown `seats_active=23, seats_reserved=51, seats_reported=75`.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.
