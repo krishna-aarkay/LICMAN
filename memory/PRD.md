@@ -532,6 +532,60 @@ LICMAN UI after the first deploy.
 - Inserted ramkella as queued → next auto-tick preempts anushama (oldest non-hipri). ✓
 - Backend startup logs show `Auto-sync loop started` + `Auto-preempt v2 loop started`; no crash on `audit.create_index`. ✓
 
+## Iteration 24 — Parse QUEUED from FlexLM debug log (lic.log) — 2026-06
+
+**User feedback** (verbatim, image attached showing `tail -f lic.log | grep Conformal_Asic`):
+> "I already mentioned user list (ramkella) in hipri and ramkella is
+> waiting, then make it automatic. again don't mess with last errors."
+
+The screenshot proved ramkella WAS queued in FlexLM:
+```
+2026-06-26 16:06:18 (cdslmd) QUEUED: "Conformal_Asic" ramkella@mctl-scsr35.moschiptech.com
+```
+But iteration 23's queued-user detection only scanned `lmstat -a` output,
+which on most production FlexLM installations does NOT include a "users
+queued" section. The QUEUED state is emitted to the vendor daemon's
+debug log (set via `DAEMON_LOG`/`REPORTLOG` or `-l <path>` flag) — never
+to lmstat.
+
+**Fix — read the real source**:
+
+1. **New field per server**: `debug_log_path` (e.g. `/cadmgr/cadence/lic.log`).
+   Surfaced in ServerDetail's "edit paths" prompt as REQUIRED for
+   auto-preempt. Empty value → auto-preempt for that server is a no-op.
+2. **New SSH helper `_tail_queued_from_debug_log(server)`**: runs
+   `tail -n 500 <path>` over the existing SSH session, parses lines
+   matching the daemon-log QUEUED/DENIED regex:
+   ```
+   2026-06-26 16:06:18 (cdslmd) QUEUED: "Conformal_Asic" ramkella@host
+   ```
+   Filters out entries older than `QUEUED_LOOKBACK_SECONDS` (default
+   120s — by then the request is stale).
+3. **`_real_checkouts_via_ssh`** merges the two queued sources: the
+   `users queued for this feature` block from lmstat (if present) AND
+   the debug-log tail. De-dupes by `(user, host, feature)`.
+4. Path validation: `debug_log_path` must match `^/[A-Za-z0-9_./+-]+$`
+   or the tail is refused (prevents shell injection via maliciously set
+   path).
+5. **Frontend** ServerDetail now shows `debug log → <path>` next to the
+   existing license/options paths. Red "(NOT SET — auto-preempt cannot
+   detect QUEUED users without this)" if empty so admins notice.
+   Priority page subtitle updated from the stale "no background
+   daemon" to the new automatic-via-lic.log model.
+
+**Verified**:
+- Parser unit-tested against the exact user log line: matches
+  `ramkella@mctl-scsr35.moschiptech.com -> Conformal_Asic` and ignores
+  IN/OUT lines.
+- Backend startup logs clean; both auto-sync and auto-preempt loops
+  start without crash.
+
+**To activate on production**: on EACH server in LICMAN UI:
+Control Room → click server → "edit paths" → fill in `debug_log_path`
+(e.g. `/cadmgr/cadence/lic.log`). After save, within ~60s the next
+auto-sync tails the log; within another ~30s the auto-preempt loop
+will preempt a lopri/non-hipri holder for any queued hipri user.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

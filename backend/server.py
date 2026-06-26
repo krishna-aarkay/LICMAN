@@ -98,6 +98,7 @@ class LicenseServer(BaseModel):
     options_file: str = ""
     license_file_path: str = ""  # Absolute path on the license host (e.g. /cadmgr/cadence/license.dat)
     options_file_path: str = ""  # Absolute path on the license host (e.g. /cadmgr/cadence/options.txt)
+    debug_log_path: str = ""     # Absolute path to FlexLM debug log (e.g. /cadmgr/cadence/lic.log) — required for auto-preempt to detect QUEUED users
     features: List[FeatureModel] = []
     ssh: SshConfig = Field(default_factory=SshConfig)
     adapter_mode: Literal["mock", "ssh"] = "mock"
@@ -113,6 +114,7 @@ class ServerCreate(BaseModel):
     daemon: str
     license_file_path: str = ""
     options_file_path: str = ""
+    debug_log_path: str = ""
 
 
 class ServerUpdate(BaseModel):
@@ -123,6 +125,7 @@ class ServerUpdate(BaseModel):
     status: Optional[Literal["up", "down", "stale"]] = None
     license_file_path: Optional[str] = None
     options_file_path: Optional[str] = None
+    debug_log_path: Optional[str] = None
 
 
 class FileContent(BaseModel):
@@ -743,7 +746,86 @@ async def _real_checkouts_via_ssh(server: dict) -> Optional[dict]:
     if res.get("exit") != 0 or not res.get("output"):
         logger.warning(f"lmstat ssh failed on {server['name']}: {res.get('output', '')[:200]}")
         return None
-    return parse_lmstat_a(res["output"], server["id"])
+    parsed = parse_lmstat_a(res["output"], server["id"])
+    # Merge queued users from the FlexLM debug log (`lic.log`/`debug.log`).
+    # `lmstat -a` does NOT include queued users on most FlexLM versions; the
+    # daemon writes QUEUED entries to its debug log instead.
+    extra = await _tail_queued_from_debug_log(server)
+    if extra:
+        # de-dupe (user, host) — debug-log entries supersede anything from lmstat
+        seen = {(q["user"].lower(), q["host"].lower(), q["feature"]) for q in parsed.get("queued", [])}
+        for q in extra:
+            k = (q["user"].lower(), q["host"].lower(), q["feature"])
+            if k not in seen:
+                parsed.setdefault("queued", []).append(q)
+                seen.add(k)
+    return parsed
+
+
+# Regex for FlexLM debug log lines like:
+#   2026-06-26 16:06:18 (cdslmd) QUEUED: "Conformal_Asic" ramkella@mctl-scsr35.moschiptech.com
+# Some vendors emit `QUEUED:` without quotes; we accept both. We also accept
+# the older `DENIED:` form because a deny followed by retry often means the
+# client will re-queue within seconds.
+_RE_DEBUG_QUEUED = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"\([^)]+\)\s+"
+    r"(?:QUEUED|DENIED):\s+"
+    r'"?(?P<feature>[A-Za-z0-9_./+-]+)"?\s+'
+    r"(?P<user>[A-Za-z0-9._-]+)"
+    r"@(?P<host>[A-Za-z0-9._-]+)"
+)
+
+
+async def _tail_queued_from_debug_log(server: dict) -> List[dict]:
+    """Tail the FlexLM debug log over SSH and return recent QUEUED entries.
+
+    Only emits entries from the last `_QUEUED_LOOKBACK_SEC` seconds (default
+    120s) — older entries are stale (the user has either given up or
+    successfully checked out).
+    """
+    ssh = server.get("ssh", {}) or {}
+    log_path = (server.get("debug_log_path") or "").strip()
+    if not log_path or not (ssh.get("enabled") and PARAMIKO_AVAILABLE):
+        return []
+    # Guard against shell injection — path must be absolute and have no
+    # whitespace/shell chars
+    if not re.match(r"^/[A-Za-z0-9_./+-]+$", log_path):
+        logger.warning(f"refusing to tail suspicious debug_log_path: {log_path!r}")
+        return []
+    decrypted = _ssh_with_decrypted(ssh)
+    # tail last 500 lines and grep — fast & bounded even on huge logs
+    cmd = f"tail -n 500 {log_path} 2>/dev/null"
+    res = await asyncio.to_thread(_ssh_real_exec, decrypted, cmd)
+    if res.get("exit") != 0 or not res.get("output"):
+        return []
+
+    lookback = int(os.environ.get("QUEUED_LOOKBACK_SECONDS", "120"))
+    cutoff = datetime.now() - timedelta(seconds=lookback)
+    out: List[dict] = []
+    for line in res["output"].splitlines():
+        m = _RE_DEBUG_QUEUED.match(line.strip())
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        out.append({
+            "server_id": server["id"],
+            "feature": m.group("feature"),
+            "user": m.group("user"),
+            "host": m.group("host"),
+            "log_ts": m.group("ts"),
+        })
+    if out:
+        logger.info(
+            f"debug-log tail on {server['name']}: found {len(out)} recent "
+            f"queued entries (window={lookback}s)"
+        )
+    return out
 
 
 async def gather_checkouts(server: dict) -> list:

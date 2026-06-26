@@ -220,10 +220,16 @@ export default function ServerDetail() {
       server?.options_file_path || "",
     );
     if (opt === null) return;
+    const dbg = window.prompt(
+      "FlexLM debug log path (REQUIRED for auto-preempt to detect QUEUED users — e.g. /cadmgr/cadence/lic.log):",
+      server?.debug_log_path || "",
+    );
+    if (dbg === null) return;
     try {
       await api.updateServer(id, {
         license_file_path: lic.trim(),
         options_file_path: opt.trim(),
+        debug_log_path: dbg.trim(),
       });
       toast.success("Paths saved");
       load();
@@ -368,6 +374,11 @@ export default function ServerDetail() {
                 <span className="text-[#6b7280]">options →</span>{" "}
                 <span className={server.options_file_path ? "text-emerald-400" : "text-amber-400"}>
                   {server.options_file_path || "(DB only — not pushed to lmgrd)"}
+                </span>
+                <br />
+                <span className="text-[#6b7280]">debug log →</span>{" "}
+                <span className={server.debug_log_path ? "text-emerald-400" : "text-red-400"}>
+                  {server.debug_log_path || "(NOT SET — auto-preempt cannot detect QUEUED users without this)"}
                 </span>
                 {isAdmin && (
                   <button

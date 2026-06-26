@@ -199,8 +199,9 @@ export default function Priority() {
             </h1>
             <p className="text-[#9ca3af] font-mono text-xs mt-1.5">
               Username-based. Two groups per feature: HIGH-PRIORITY (may
-              preempt) and LOW-PRIORITY (may be preempted). Triggered on
-              demand from the REQUEST panel — no background daemon, no SGE.
+              preempt) and LOW-PRIORITY (may be preempted). Triggered
+              automatically when a hipri user is QUEUED in FlexLM
+              (parsed from the daemon&apos;s <code>lic.log</code>). No SGE.
             </p>
           </div>
           <button
