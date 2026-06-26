@@ -586,6 +586,38 @@ Control Room → click server → "edit paths" → fill in `debug_log_path`
 auto-sync tails the log; within another ~30s the auto-preempt loop
 will preempt a lopri/non-hipri holder for any queued hipri user.
 
+## Iteration 25 — FINAL fix: parse "queued for N license" inline format — 2026-06
+
+**The actual bug** (from user's annotated screenshot showing both lmstat AND lic.log):
+
+User's lmstat output had ramkella's queued line right inside the Users-of block:
+```
+    ramkella mctl-scsr35.moschiptech.com unix:0 (v21.200) (localhost/5280 3317) queued for 1 license
+```
+
+The existing `_RE_USER_LINE` regex required a `, start <day> ...` trailer. Ramkella's line ends with `queued for 1 license` → regex FAILED → ramkella was SILENTLY DROPPED. She never appeared in `checkouts` (correct) but never appeared in `queued` either (BUG). Result: auto-preempt loop saw 0 queued hipri users and skipped with `no_hipri_queued` forever.
+
+**Fix**: new regex `_RE_USER_QUEUED_INLINE` runs BEFORE `_RE_USER_LINE` in `parse_lmstat_a`:
+```python
+_RE_USER_QUEUED_INLINE = re.compile(
+    r"^\s+(?P<user>\S+)\s+(?P<host>\S+)\s+(?P<display>\S+)\s+"
+    r"\(v?(?P<ver>[^)]+)\)\s+\((?P<lic>\S+)\s+(?P<pid>\d+)\)\s+"
+    r"queued\s+for\s+(?P<count>\d+)\s+licenses?",
+    re.IGNORECASE,
+)
+```
+Lines matching it go to `queued`. Lines matching the regular `_RE_USER_LINE` (with `, start ...`) still go to `checkouts`. Both signals also still merged with `_tail_queued_from_debug_log` (iteration 24, lic.log parsing).
+
+**Verified against user's EXACT screenshot data**:
+- 5 holders correctly classified: manikant, adityaa, mdeepika, anushama, kishorei
+- 1 queued: ramkella → Conformal_Asic
+- total=5, in_use_reported=5 (saturation correctly detected)
+- Auto-tick → preempted oldest non-hipri holder (manikant, started 14:48)
+- 4 holders remain → FlexLM frees one seat → ramkella's `lmutil` claims it
+- No `hipri_already_holds_seat` false-trigger (ramkella in queued_users, not in checkouts)
+
+This is the bug that's been blocking real-world use for the last 4 iterations. The lic.log tail (iter 24) was correct but redundant on installations that surface QUEUED in lmstat already; the inline parser fix (iter 25) covers the more common case.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

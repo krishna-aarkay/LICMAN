@@ -543,11 +543,19 @@ _RE_FEATURE_META = re.compile(
     r'(?:,\s*expiry:\s*(?P<expires>\S+))?',
     re.IGNORECASE,
 )
-# Example:  ramak edaserver1 :0.0 (v17.1) (hostname/5280 102), start Wed 5/14 9:42
+# Example holder:  ramak edaserver1 :0.0 (v17.1) (hostname/5280 102), start Wed 5/14 9:42
 _RE_USER_LINE = re.compile(
     r"^\s+(?P<user>\S+)\s+(?P<host>\S+)\s+(?P<display>\S+)\s+"
     r"\(v?(?P<ver>[^)]+)\)\s+\((?P<lic>\S+)\s+(?P<pid>\d+)\),\s+start\s+(?P<when>.+?)"
     r"(?:,\s*(?P<count>\d+)\s+licenses?)?$"
+)
+# Example queued (no `, start ...` trailer — has `queued for N license` instead):
+#   ramkella mctl-scsr35.moschiptech.com unix:0 (v21.200) (localhost/5280 3317) queued for 1 license
+_RE_USER_QUEUED_INLINE = re.compile(
+    r"^\s+(?P<user>\S+)\s+(?P<host>\S+)\s+(?P<display>\S+)\s+"
+    r"\(v?(?P<ver>[^)]+)\)\s+\((?P<lic>\S+)\s+(?P<pid>\d+)\)\s+"
+    r"queued\s+for\s+(?P<count>\d+)\s+licenses?",
+    re.IGNORECASE,
 )
 _MONTH_NAMES = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
                 "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
@@ -663,6 +671,15 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
                     "user": qm.group("user"),
                     "host": qm.group("host"),
                 })
+            continue
+        mu_q = _RE_USER_QUEUED_INLINE.match(line)
+        if mu_q and current_feature:
+            queued.append({
+                "server_id": server_id,
+                "feature": current_feature,
+                "user": mu_q.group("user"),
+                "host": mu_q.group("host"),
+            })
             continue
         mu = _RE_USER_LINE.match(line)
         if mu and current_feature:
