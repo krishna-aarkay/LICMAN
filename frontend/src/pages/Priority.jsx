@@ -218,15 +218,17 @@ export default function Priority() {
           data-testid="design-statement-banner"
         >
           <div className="flex items-start gap-2">
-            <Crown size={13} className="text-amber-400 mt-0.5 shrink-0" />
+            <Crown size={13} className="text-emerald-400 mt-0.5 shrink-0" />
             <div className="text-[#9ca3af] leading-relaxed">
-              <span className="text-amber-400 uppercase tracking-[0.2em] text-[10px]">
-                REQUEST-DRIVEN
+              <span className="text-emerald-400 uppercase tracking-[0.2em] text-[10px]">
+                AUTO · DEMAND-DRIVEN
               </span>{" "}
-              · Preemption fires ONLY when a HIGH-PRIORITY user clicks
-              REQUEST below. There is no background daemon scanning
-              saturated features — if no hipri user is asking, all current
-              holders keep their seats untouched.
+              · Preemption fires <strong>automatically</strong> when a
+              HIGH-PRIORITY user is QUEUED for a feature in FlexLM (= they
+              ran a tool, got denied because saturated, and are waiting).
+              When no hipri user is queued, current holders keep their
+              seats untouched. You can also force a preempt on demand by
+              clicking REQUEST below.
             </div>
           </div>
         </section>

@@ -472,6 +472,66 @@ iteration-20 cooldown + iteration-18 lmremove host-variant retries — so
 the manual REQUEST path is still robust against stale-DB and FQDN
 mismatch issues.
 
+## Iteration 23 — Auto-preempt with REAL demand signal (FlexLM QUEUED) — 2026-06
+
+**User feedback** (escalating frustration):
+> "why again you are saying the manual preemption, then why are we here
+> and the use of all this. Please make the preemtion automatic based on
+> the highpri list."
+
+I had misread iteration 22 — they wanted automation, but the "trigger"
+should be a real signal that a hipri user is actually waiting, not
+"feature is saturated" (which was the iteration-16 model that caused
+random kills). The correct signal: **FlexLM's QUEUED state** (`users
+queued for this feature` in `lmstat -a` output) — emitted when a user
+runs a tool, the feature is saturated, and the daemon parks them in
+the wait queue.
+
+**Changes**:
+
+1. **Parser** (`parse_lmstat_a`) now extracts a `queued: List[{server_id,
+   feature, user, host}]` array alongside `features` and `checkouts`.
+   Detects either:
+   - `N users queued for this feature` block (multi-line)
+   - `user @ host`, `user, host`, or `user host` formats
+2. **`gather_checkouts`** and **`_refresh_server_state`** now upsert
+   queued users into a new `db.queued_users` collection (wholesale
+   delete + insert — queue state is transient).
+3. **`_auto_preempt_tick_v2`** gains a new "DEMAND SIGNAL" gate BEFORE
+   evaluating saturation:
+   ```python
+   queued_hipri = [
+       q for q in db.queued_users.find({server_id, feature})
+       if q.user.lower() in hipri_set
+   ]
+   if not queued_hipri:
+       reasons.append({skip: "no_hipri_queued"})
+       continue
+   ```
+   The loop is a strict no-op for every (server, feature) where no
+   hipri user is currently queued. Only when a hipri user IS queued
+   does the rest of the logic (saturation check, lopri victim
+   selection, lmremove) run.
+4. **Background loop RE-ENABLED** on startup (was disabled in iteration
+   22 because demand-detection didn't exist yet).
+5. **Production startup crash** (`audit.create_index` race on first
+   boot caused HTTP 502): wrapped in try/except so re-deploys never
+   leave the API down. `queued_users` collection gets its own index.
+6. **Frontend banner** changed from amber "REQUEST-DRIVEN" to emerald
+   "AUTO · DEMAND-DRIVEN" explaining the new model.
+
+**FERNET_KEY warning** (separate prod issue caught from user's log):
+The Fernet key changes on every redeploy by default → stored SSH
+passwords can't be decrypted → all lmstat calls fail with paramiko
+auth error. Documented in PRD: users must set a stable `FERNET_KEY`
+env var in their deploy `.env` and re-enter SSH credentials in the
+LICMAN UI after the first deploy.
+
+**Verified**:
+- Seeded 5/5 saturated, NO queued user → auto-tick reasons: `no_hipri_queued, queued_users=[]`. Zero preempts. ✓
+- Inserted ramkella as queued → next auto-tick preempts anushama (oldest non-hipri). ✓
+- Backend startup logs show `Auto-sync loop started` + `Auto-preempt v2 loop started`; no crash on `audit.create_index`. ✓
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

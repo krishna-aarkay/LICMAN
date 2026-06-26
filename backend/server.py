@@ -586,28 +586,40 @@ def _parse_start_to_iso(when: str) -> str:
 
 
 def parse_lmstat_a(text: str, server_id: str) -> dict:
-    """Return dict {features: [...], checkouts: [...]} parsed from `lmstat -a` output.
-    Captures both the server-reported `in use` count (authoritative) and individual
-    user-line checkouts. Also gathers ALL increment expiry lines per feature."""
+    """Return dict {features, checkouts, queued} parsed from `lmstat -a`.
+    - features: per-feature totals + expiry info
+    - checkouts: list of current holders (user, host, display, pid, ...)
+    - queued: list of users WAITING for a saturated feature. FlexLM emits
+      this when a user runs `lmutil` against a fully-checked-out feature —
+      they get parked in the wait queue. This is the only reliable
+      "hipri user wants this feature" signal we have without SGE.
+
+    Queued lines look like (FlexLM standard):
+        N users queued for this feature
+            user host  (some FlexLM versions)
+        OR
+            user @ host
+    """
     features: dict = {}
     checkouts: list = []
+    queued: list = []
     current_feature = None
+    in_queued_block = False
 
     lines = (text or "").splitlines()
     for i, line in enumerate(lines):
         m = _RE_USERS_OF.match(line)
         if m:
             current_feature = m.group("feature")
+            in_queued_block = False
             features[current_feature] = {
                 "name": current_feature,
                 "total": int(m.group("total")),
                 "in_use_reported": int(m.group("inuse")),
                 "version": "",
                 "expires": "permanent",
-                "increments": [],  # All INCREMENT/feature-meta lines for this feature
+                "increments": [],
             }
-            # Scan forward until the next `Users of` line, collecting every
-            # FEATURE_META line that belongs to this feature.
             for j in range(i + 1, len(lines)):
                 if _RE_USERS_OF.match(lines[j]):
                     break
@@ -621,8 +633,33 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
                     features[current_feature]["increments"].append({
                         "version": mm.group("version"),
                         "expires": mm.group("expires") or "permanent",
-                        "count": 0,  # filled by license-file parser if available
+                        "count": 0,
                     })
+            continue
+        # Detect "N users queued for this feature" header — switch parser
+        # mode so the following indented user lines go into `queued`, not
+        # `checkouts`.
+        if current_feature and re.search(r"users?\s+queued\s+for\s+this\s+feature",
+                                         line, re.IGNORECASE):
+            in_queued_block = True
+            continue
+        if in_queued_block and current_feature:
+            stripped = line.strip()
+            if not stripped:
+                in_queued_block = False
+                continue
+            # Try: "user host ..." or "user @ host" or "user, host ..."
+            qm = re.match(
+                r"^(?P<user>[A-Za-z0-9._-]+)\s*[@,]?\s*(?P<host>[A-Za-z0-9._-]+)",
+                stripped,
+            )
+            if qm:
+                queued.append({
+                    "server_id": server_id,
+                    "feature": current_feature,
+                    "user": qm.group("user"),
+                    "host": qm.group("host"),
+                })
             continue
         mu = _RE_USER_LINE.match(line)
         if mu and current_feature:
@@ -655,6 +692,7 @@ def parse_lmstat_a(text: str, server_id: str) -> dict:
             for f in features.values()
         ],
         "checkouts": checkouts,
+        "queued": queued,
     }
 
 
@@ -694,7 +732,7 @@ def parse_license_file_increments(content: str) -> dict:
 
 
 async def _real_checkouts_via_ssh(server: dict) -> Optional[dict]:
-    """Returns {features, checkouts} parsed from real lmstat output, or None on failure."""
+    """Returns {features, checkouts, queued} parsed from real lmstat output, or None on failure."""
     ssh = server.get("ssh", {}) or {}
     if not (ssh.get("enabled") and PARAMIKO_AVAILABLE):
         return None
@@ -714,19 +752,23 @@ async def gather_checkouts(server: dict) -> list:
     if mode == "ssh":
         parsed = await _real_checkouts_via_ssh(server)
         if parsed is not None:
-            # Merge license-file INCREMENT counts into each feature so the
-            # Expiry calendar shows separate rows per tranche.
             lic_content = server.get("license_file") or ""
             inc_map = parse_license_file_increments(lic_content) if lic_content else {}
             for feat in parsed["features"]:
                 inc_from_file = inc_map.get(feat["name"]) or []
                 if inc_from_file:
-                    # Prefer file data — it's the source of truth for per-tranche counts
                     feat["increments"] = inc_from_file
             if parsed["features"]:
                 await db.servers.update_one(
                     {"id": server["id"]}, {"$set": {"features": parsed["features"]}}
                 )
+            # Persist queued users (used by the auto-preempt demand sensor)
+            await db.queued_users.delete_many({"server_id": server["id"]})
+            if parsed.get("queued"):
+                await db.queued_users.insert_many([
+                    {**q, "ts": datetime.now(timezone.utc).isoformat()}
+                    for q in parsed["queued"]
+                ])
             return parsed["checkouts"]
         # SSH failed → fall back to empty (do NOT lie with simulated data)
         return []
@@ -2174,9 +2216,17 @@ async def _refresh_server_state(server_id: str):
         await db.checkouts.delete_many({"server_id": server_id})
         if parsed["checkouts"]:
             await db.checkouts.insert_many([{**c} for c in parsed["checkouts"]])
+        # NEW: persist queued users for this server. Replace wholesale —
+        # queue state is highly transient.
+        await db.queued_users.delete_many({"server_id": server_id})
+        if parsed.get("queued"):
+            await db.queued_users.insert_many([
+                {**q, "ts": datetime.now(timezone.utc).isoformat()}
+                for q in parsed["queued"]
+            ])
         logger.info(
             f"post-preempt refresh: {doc['name']} now has "
-            f"{len(parsed['checkouts'])} checkouts in DB"
+            f"{len(parsed['checkouts'])} checkouts, {len(parsed.get('queued') or [])} queued"
         )
     except Exception as e:
         logger.warning(f"post-preempt refresh failed: {e}")
@@ -2237,6 +2287,25 @@ async def _auto_preempt_tick_v2() -> dict:
         srv = await db.servers.find_one({"id": server_id}, {"_id": 0})
         if not srv:
             reasons.append({"feature": feature, "skip": "server_missing"})
+            continue
+
+        # ─── DEMAND SIGNAL ─── Only preempt when a hipri user actually wants
+        # this feature. The signal is FlexLM's wait queue (`users queued for
+        # this feature` in lmstat output). If no hipri user is queued, do
+        # nothing — current holders keep their seats untouched.
+        queued = await db.queued_users.find(
+            {"server_id": server_id, "feature": feature}, {"_id": 0}
+        ).to_list(200)
+        queued_hipri = [
+            q for q in queued
+            if q.get("user", "").lower() in hipri_set
+        ]
+        if not queued_hipri:
+            reasons.append({
+                "feature": feature, "server": srv["name"],
+                "skip": "no_hipri_queued",
+                "queued_users": [q.get("user") for q in queued],
+            })
             continue
         feat = next((f for f in (srv.get("features") or [])
                      if f["name"] == feature), None)
@@ -4386,8 +4455,19 @@ async def startup_event():
     except Exception:
         pass
     # Note: TTL needs a real BSON Date, not a string. We add a `ts` field on inserts via a wrapper.
-    await db.audit.create_index([("timestamp", -1)])
-    await db.audit.create_index("ts", expireAfterSeconds=ttl_days * 86400)
+    try:
+        await db.audit.create_index([("timestamp", -1)])
+    except Exception as e:
+        logger.warning(f"audit timestamp index skipped: {e}")
+    try:
+        await db.audit.create_index("ts", expireAfterSeconds=ttl_days * 86400)
+    except Exception as e:
+        logger.warning(f"audit TTL index skipped: {e}")
+    # NEW collection: queued_users (auto-preempt demand sensor)
+    try:
+        await db.queued_users.create_index([("server_id", 1), ("feature", 1)])
+    except Exception as e:
+        logger.warning(f"queued_users index skipped: {e}")
     # Usage history TTL — keep last USAGE_TTL_DAYS (default 365 days)
     usage_ttl_days = int(os.environ.get("USAGE_TTL_DAYS", "365"))
     try:
@@ -4399,14 +4479,12 @@ async def startup_event():
     # Start auto-sync loop
     if os.environ.get("SYNC_INTERVAL_SECONDS", "60") != "0":
         _sync_task = asyncio.create_task(_periodic_sync_loop())
-    # NOTE: the proactive auto-preempt daemon is intentionally NOT started.
-    # By design, preemption is strictly REQUEST-DRIVEN — a hipri user (or
-    # admin on their behalf) clicks REQUEST on the Priority page → backend
-    # kills a lopri holder. The daemon kept firing on every interval just
-    # because a feature was saturated, even when no hipri user had asked,
-    # which led to surprise kills (kishorei, anushama, mdeepika). Removed.
-    # The /api/feature-priorities/auto-tick endpoint stays for manual
-    # diagnostic use but is no longer wired to a background scheduler.
+    # Auto-preempt v2 — RE-ENABLED with proper demand signal. The loop is a
+    # strict no-op unless a hipri user is currently QUEUED in FlexLM for a
+    # configured feature. See `_auto_preempt_tick_v2.no_hipri_queued`.
+    global _preempt_task
+    if os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30") != "0":
+        _preempt_task = asyncio.create_task(_auto_preempt_loop_v2())
 
 
 @app.on_event("shutdown")
