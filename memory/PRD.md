@@ -426,6 +426,52 @@ The iteration-20 cooldown only triggered AFTER a successful preempt. But this sc
 - Seeded 5/5 saturated, ramkella NOT in DB → auto-tick preempted oldest (mock mode); second tick immediately → cooldown reason `cadence-prod-01 → Conformal_Asic · 175s remaining`.
 - Refresh helper is best-effort; failures are silent (periodic sync catches up).
 
+## Iteration 22 — Removed proactive auto-preempt daemon (REQUEST-DRIVEN only) — 2026-06
+
+**User clear directive** (verbatim, after 3 iterations of stale-DB / cascade kill issues):
+> "When a highpri user request a feature then only the trigger has to check
+> and release the feature if all in use. but shuold not check for every
+> time and release and keep it ready for highpri user. if highpri user no
+> requests then the features can continue to in use for everyone no need
+> to release them."
+
+This contradicted the "auto-preempt daemon" model from iteration 16
+(which proactively kept a seat warm for hipri pools by scanning saturated
+features on every tick). The audit log proved the daemon was the source
+of the surprise kills (kishorei → anushama → mdeepika across 18 minutes
+even when no hipri user had asked).
+
+**Change**:
+- Background `_auto_preempt_loop_v2()` is no longer started on app boot
+  (commented out in `startup_event`). Code path retained in-file for
+  manual diagnostic via `POST /api/feature-priorities/auto-tick` only.
+- Settings page: "AUTO-PREEMPT DAEMON" panel replaced with a "DEPRECATED"
+  placeholder explaining the new model. Toggle + interval inputs removed.
+- Priority page: removed the auto-preempt status banner, last-tick
+  diagnostic, and "TICK NOW" button. In their place a small amber
+  "REQUEST-DRIVEN · Preemption fires ONLY when a HIGH-PRIORITY user
+  clicks REQUEST below" callout.
+- Removed unused `featurePriorityAutoStatus` polling from Priority page.
+
+**Behaviour going forward**:
+- A hipri user (or admin on their behalf) clicks REQUEST → `POST
+  /api/feature-priorities/request` → kill one lopri / non-hipri holder → done.
+- Features stay with their current holders if no REQUEST arrives, even
+  if 100% saturated.
+
+**Verified**:
+- Startup logs show only `Auto-sync loop started`, NOT `Auto-preempt v2
+  loop started`. ✓
+- Seeded 5/5 saturated, no hipri holder → waited 35s (longer than the
+  old 30s tick interval) → all 5 holders still present. ✓
+- POST /api/feature-priorities/request → preempted oldest (anushama) →
+  4 holders remain. ✓
+
+The on-demand REQUEST flow KEPT the iteration-21 pre-flight refresh +
+iteration-20 cooldown + iteration-18 lmremove host-variant retries — so
+the manual REQUEST path is still robust against stale-DB and FQDN
+mismatch issues.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

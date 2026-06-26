@@ -4399,10 +4399,14 @@ async def startup_event():
     # Start auto-sync loop
     if os.environ.get("SYNC_INTERVAL_SECONDS", "60") != "0":
         _sync_task = asyncio.create_task(_periodic_sync_loop())
-    # Start the v2 auto-preempt loop (no-op unless auto_preempt_enabled=true in Settings)
-    global _preempt_task
-    if os.environ.get("AUTO_PREEMPT_INTERVAL_SECONDS", "30") != "0":
-        _preempt_task = asyncio.create_task(_auto_preempt_loop_v2())
+    # NOTE: the proactive auto-preempt daemon is intentionally NOT started.
+    # By design, preemption is strictly REQUEST-DRIVEN — a hipri user (or
+    # admin on their behalf) clicks REQUEST on the Priority page → backend
+    # kills a lopri holder. The daemon kept firing on every interval just
+    # because a feature was saturated, even when no hipri user had asked,
+    # which led to surprise kills (kishorei, anushama, mdeepika). Removed.
+    # The /api/feature-priorities/auto-tick endpoint stays for manual
+    # diagnostic use but is no longer wired to a background scheduler.
 
 
 @app.on_event("shutdown")
