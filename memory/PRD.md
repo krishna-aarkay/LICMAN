@@ -618,6 +618,51 @@ Lines matching it go to `queued`. Lines matching the regular `_RE_USER_LINE` (wi
 
 This is the bug that's been blocking real-world use for the last 4 iterations. The lic.log tail (iter 24) was correct but redundant on installations that surface QUEUED in lmstat already; the inline parser fix (iter 25) covers the more common case.
 
+## Iteration 26 — Multi-user HI-PRI bug — 2026-06
+
+**User report** (3rd consecutive blocker, screenshot showed HI-PRI=[ramkella,anushama], anushama holding, ramkella queued, no preempt):
+
+The guard at the start of the auto-loop did:
+```python
+if any(h.user.lower() in hipri_set for h in holders):
+    skip("hipri_already_holds_seat")
+```
+
+This was wrong by design when HI-PRI has MORE THAN ONE user: anushama
+holding a seat does nothing for ramkella who's still queued. The guard
+fired → loop skipped → ramkella waited forever.
+
+**Fix**: per-queued-user check:
+```python
+queued_hipri_users  = [q.user for q in queued_hipri]
+queued_not_holding  = [u for u in queued_hipri_users
+                       if u.lower() not in holder_users_lower]
+if not queued_not_holding:
+    skip("all_queued_hipri_already_hold")
+    continue
+```
+
+Now the loop skips ONLY when every queued hipri user is already
+holding. Otherwise it proceeds to preempt one non-hipri/lopri holder.
+
+**Victim selection is already correct** — both `implicit_lopri` and
+`lopri_set` branches exclude every user in `hipri_set`, so anushama
+(also hipri) will never be preempted even though she's a non-queued
+holder.
+
+**Verified against EXACT screenshot scenario**:
+- 5 holders (anushama=hipri, manikant/adityaa/mdeepika/kishorei=non-hipri)
+- ramkella queued (also hipri)
+- Auto-tick → preempted **kishorei** (oldest non-hipri, 16:04:50)
+- anushama UNTOUCHED ✓
+- 4 holders remain → ramkella claims freed seat from FlexLM queue
+
+This + iteration 25's queued-line regex fix + iteration 24's lic.log
+tail = the complete auto-preempt pipeline. The dashboard reliably
+detects queued hipri users via TWO independent paths (inline lmstat
+suffix + daemon debug log) and preempts only when needed, only the
+oldest non-hipri holder, with cooldown to prevent cascades.
+
 ## Open Concerns / Tech Debt
 - `server.py` is ~1968 lines — strongly recommend splitting into `auth.py`, `crypto.py`, `scheduler.py`, `bulk_ops.py`, `options_validator.py`, `csv_exports.py` before the next feature batch.
 - `send_webhook` uses stdlib `urllib` — fine for stdlib-only/air-gapped builds, but blocks the event loop. Consider `asyncio.to_thread` wrap (consistent with `_ssh_real_exec`) when refactoring.

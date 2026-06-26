@@ -2433,12 +2433,24 @@ async def _auto_preempt_tick_v2() -> dict:
             })
             continue
 
-        # If ANY hipri user is already holding a seat, the rule is satisfied;
-        # don't kill another lopri unnecessarily.
-        if any(h.get("user", "").lower() in hipri_set for h in holders):
+        # We already established that ≥1 hipri user is QUEUED for this
+        # feature (the `no_hipri_queued` gate above). Now check whether each
+        # of those queued users is *also* listed as a holder — if so, we
+        # don't need to preempt for them. But if at least one queued hipri
+        # user is NOT holding, we MUST preempt.
+        # Important: do NOT skip just because some OTHER hipri user holds a
+        # seat — that user being satisfied does nothing for the queued one.
+        holder_users_lower = {h.get("user", "").lower() for h in holders}
+        queued_hipri_users = [q.get("user", "") for q in queued_hipri]
+        queued_not_holding = [
+            u for u in queued_hipri_users
+            if u and u.lower() not in holder_users_lower
+        ]
+        if not queued_not_holding:
             reasons.append({
                 "feature": feature, "server": srv["name"],
-                "skip": "hipri_already_holds_seat",
+                "skip": "all_queued_hipri_already_hold",
+                "queued_hipri_users": queued_hipri_users,
             })
             continue
 
